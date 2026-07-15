@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # Tuple used by sort atoms
 
 from core.agent.message import OpenAIMessage
 
@@ -30,7 +30,6 @@ class TimelineBuilder:
         chars_per_token: float = 2.0,
         include_tool_traces: bool = True,
         drop_unpaired_tools: bool = True,
-        prefer_official_content: bool = True,
         cross_session_time_order: bool = True,
         debug: bool = False,
         logger=None,
@@ -39,7 +38,6 @@ class TimelineBuilder:
         self.chars_per_token = max(0.1, float(chars_per_token or 2.0))
         self.include_tool_traces = include_tool_traces
         self.drop_unpaired_tools = drop_unpaired_tools
-        self.prefer_official_content = prefer_official_content
         self.cross_session_time_order = cross_session_time_order
         self.debug = debug
         self.logger = logger
@@ -185,11 +183,58 @@ class TimelineBuilder:
                 )
                 order += 1
 
-        result.sort(key=lambda m: m.sort_key)
-        # reassign sequential order after sort (preserve relative tool chains within same sid chunk)
+        # 按「轮」原子排序：同一 sid 内 user→assistant/tool 链不拆开，
+        # 避免跨会话时间交错把 tool 链切断导致模型重复调工具。
+        result = self._sort_preserving_round_atoms(result)
         for i, m in enumerate(result):
             m.order = i
         return result
+
+    def _sort_preserving_round_atoms(
+        self, msgs: List[TimelineMessage]
+    ) -> List[TimelineMessage]:
+        """
+        先按 sid 内原始顺序切成轮（user 起头），轮内顺序不变；
+        再按轮的 sort_key（首条消息）做全局时间序。
+        """
+        if not msgs:
+            return []
+        if not self.cross_session_time_order:
+            # 非交错：保持 collect 时的 sid 分段顺序即可
+            return msgs
+
+        # 按 source_sid 分组，保持各 sid 内 order
+        by_sid: Dict[str, List[TimelineMessage]] = {}
+        sid_order: List[str] = []
+        for m in msgs:
+            if m.source_sid not in by_sid:
+                by_sid[m.source_sid] = []
+                sid_order.append(m.source_sid)
+            by_sid[m.source_sid].append(m)
+
+        atoms: List[Tuple[Tuple, List[TimelineMessage]]] = []
+        for sid in sid_order:
+            seq = by_sid[sid]
+            seq.sort(key=lambda x: x.order)
+            cur: List[TimelineMessage] = []
+            for m in seq:
+                if m.role == "user":
+                    if cur:
+                        atoms.append((cur[0].sort_key, cur))
+                    cur = [m]
+                else:
+                    if not cur:
+                        cur = [m]
+                    else:
+                        cur.append(m)
+            if cur:
+                atoms.append((cur[0].sort_key, cur))
+
+        atoms.sort(key=lambda x: x[0])
+        out: List[TimelineMessage] = []
+        for _, chunk in atoms:
+            out.extend(chunk)
+        return out
 
     def sanitize_tool_pairs(self, msgs: List[TimelineMessage]) -> List[TimelineMessage]:
         if not self.drop_unpaired_tools:
@@ -323,12 +368,16 @@ class TimelineBuilder:
         - compact: [gm:123|绿岛酒吧]
         - none:    不加
 
-        tool 永不加前缀。assistant 的 <msg> 通常无群名，需要前缀。
+        tool / assistant 永不加前缀（对齐官方独立会话：assistant 原样落盘）。
         user 若已有 group_name，仅补极短 [session: sid]（prefix）或跳过（若 sid 已在文中）。
+        来源与「在哪」靠：user 前缀 + window_anchor / chat_env。
         """
         if mode == "none" or not source_sid:
             return ""
         if role == "tool":
+            return ""
+        # 对齐官方：assistant 历史从不带会话前缀，避免模型学样输出污染落盘
+        if role == "assistant":
             return ""
 
         parts = source_sid.split(":", 2)

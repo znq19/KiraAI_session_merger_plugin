@@ -67,6 +67,17 @@ class ObservePool:
             if self.logger:
                 self.logger.warning("[observe] load failed: %s", e)
 
+    def clear(self):
+        """清空观察池内存并落盘。"""
+        self._data.clear()
+        self._seen_ids.clear()
+        self._dirty = self.flush_every
+        try:
+            self.flush(force=True)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning("[observe] clear flush failed: %s", e)
+
     def flush(self, force: bool = False):
         if not force and self._dirty < self.flush_every:
             return
@@ -183,41 +194,91 @@ class ObservePool:
                 out.append({"role": "user", "content": text})
         return out
 
+    @staticmethod
+    def _content_already_has_source(content: str) -> bool:
+        """与 timeline 一致：正文已含官方身份字段则不再堆群名/昵称。"""
+        if not content:
+            return False
+        head = content[:240]
+        return (
+            "group_name:" in head
+            or "group_id:" in head
+            or "user_nickname:" in head
+            or "user_id:" in head
+            or head.startswith("[source_sid:")
+            or head.startswith("[session:")
+        )
+
+    def _format_source_prefix_like_timeline(
+        self,
+        sid: str,
+        mode: str,
+        content: str,
+        group_name: str,
+        sender_name: str,
+    ) -> str:
+        """
+        对齐 timeline._format_source_prefix（user 角色最新规则）：
+        - prefix: [session: sid] [group_name/user_nickname|chat_type]
+        - compact: [st:entity|title]
+        - none: 空
+        已有官方字段时只补短 [session: sid]。
+        """
+        if mode == "none" or not sid:
+            return ""
+
+        parts = sid.split(":", 2)
+        st = parts[1] if len(parts) >= 2 else ""
+        entity = parts[2] if len(parts) >= 3 else sid
+        # 观察池有群名/发送者时优先；否则无 title（与 timeline 无标题时走 chat_type）
+        title = group_name or sender_name or ""
+
+        if self._content_already_has_source(content):
+            if sid in content[:120]:
+                return ""
+            if mode == "compact":
+                return f"[{st}:{entity}] " if st else f"[{sid}] "
+            return f"[session: {sid}] "
+
+        if mode == "compact":
+            if title:
+                return f"[{st}:{entity}|{title}] " if st else f"[{sid}|{title}] "
+            return f"[{st}:{entity}] " if st else f"[{sid}] "
+
+        # prefix：与 timeline 相同分支
+        if st == "gm":
+            if title:
+                return f"[session: {sid}] [group_name: {title}] "
+            return f"[session: {sid}] [chat_type: group] "
+        if st == "dm":
+            if title:
+                return f"[session: {sid}] [user_nickname: {title}] "
+            return f"[session: {sid}] [chat_type: private] "
+        if title:
+            return f"[session: {sid}] [title: {title}] "
+        return f"[session: {sid}] "
+
     def _format_peek_content(self, it: Dict[str, Any], mode: str) -> str:
+        """
+        偷看注入文案 = 与合并时间线一致的来源前缀 + peek 标记 + 原文。
+        peek 标记仅偷看需要，正式合并历史没有。
+        """
         sid = str(it.get("sid") or "")
         content = str(it.get("content") or "").strip()
         if not content:
             return ""
         group_name = str(it.get("group_name") or "").strip()
         sender_name = str(it.get("sender_name") or "").strip()
-        parts = sid.split(":", 2)
-        st = parts[1] if len(parts) >= 2 else ""
-        entity = parts[2] if len(parts) >= 3 else sid
 
-        if mode == "none":
-            prefix = "[msg_type: peek] [not_addressed_to_you] "
-        elif mode == "compact":
-            label = group_name or sender_name or entity
-            prefix = f"[{st}:{entity}|{label}|peek] "
-        else:
-            # prefix — 官方风格
-            bits = [f"[session: {sid}]"]
-            if st == "gm" and group_name:
-                bits.append(f"[group_name: {group_name}]")
-            elif st == "dm" and sender_name:
-                bits.append(f"[user_nickname: {sender_name}]")
-            elif group_name:
-                bits.append(f"[group_name: {group_name}]")
-            elif sender_name:
-                bits.append(f"[user_nickname: {sender_name}]")
-            bits.append("[msg_type: peek]")
-            bits.append("[not_addressed_to_you]")
-            prefix = " ".join(bits) + " "
-
-        # 避免双重 peek 标记
-        if "[msg_type: peek]" in content[:80]:
+        # 已带 peek 标记：不再外包（避免双重）
+        if "[msg_type: peek]" in content[:120]:
             return content
-        return prefix + content
+
+        source = self._format_source_prefix_like_timeline(
+            sid, mode or "prefix", content, group_name, sender_name
+        )
+        peek_tag = "[msg_type: peek] [not_addressed_to_you] "
+        return f"{source}{peek_tag}{content}"
 
     def stats(self) -> Dict[str, Any]:
         return {

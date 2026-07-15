@@ -25,8 +25,6 @@ from .timeline import TimelineBuilder
 class MergeEngine:
     """读时合并 + 软/硬重启 + 未唤醒偷看。"""
 
-    MERGE_TIMEOUT_SEC = 3.0
-
     def __init__(
         self,
         session_mgr,
@@ -34,7 +32,7 @@ class MergeEngine:
         timeline: TimelineBuilder,
         observe_pool: Optional[ObservePool] = None,
         max_merged_chunks: int = 10,
-        merge_token_limit: int = 15000,
+        merge_token_limit: int = 30000,
         merge_keep_turns: int = 6,
         merge_reset_mode: str = "soft",
         merge_check_interval_sec: int = 60,
@@ -48,6 +46,7 @@ class MergeEngine:
         source_tag_mode: str = "prefix",
         enable_window_anchor: bool = True,
         window_anchor_prompt: str = "",
+        merge_build_timeout_sec: float = 5.0,
         debug: bool = False,
         log_preview: bool = False,
         logger=None,
@@ -57,11 +56,12 @@ class MergeEngine:
         self.timeline = timeline
         self.observe_pool = observe_pool
         self.max_merged_chunks = max(1, int(max_merged_chunks or 10))
-        self.merge_token_limit = max(0, int(merge_token_limit or 15000))
+        self.merge_token_limit = max(0, int(merge_token_limit or 30000))
         self.merge_keep_turns = max(1, int(merge_keep_turns or 6))
         self.merge_reset_mode = (merge_reset_mode or "soft").strip().lower()
         if self.merge_reset_mode not in ("soft", "hard"):
             self.merge_reset_mode = "soft"
+        self.merge_build_timeout_sec = max(1.0, float(merge_build_timeout_sec or 5.0))
         self.chars_per_token = float(chars_per_token or 2.0)
         self.max_merge_sessions = max(1, int(max_merge_sessions or 8))
         self.other_session_timeout = int(other_session_timeout or 0)
@@ -275,15 +275,26 @@ class MergeEngine:
         )
         return True
 
+    def _merge_timeout(self) -> float:
+        """soft 用配置值；hard 至少 8s（磁盘重开更慢）。"""
+        base = float(self.merge_build_timeout_sec or 5.0)
+        if self.merge_reset_mode == "hard":
+            return max(base, 8.0)
+        return max(1.0, base)
+
     async def apply_to_request(self, event, req: LLMRequest) -> bool:
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._apply_sync, event, req),
-                timeout=self.MERGE_TIMEOUT_SEC if self.merge_reset_mode == "soft" else 8.0,
+                timeout=self._merge_timeout(),
             )
         except asyncio.TimeoutError:
             if self.logger:
-                self.logger.warning("[MERGER] merge timeout, skip merge")
+                self.logger.warning(
+                    "[MERGER] merge timeout (%.1fs mode=%s), skip merge",
+                    self._merge_timeout(),
+                    self.merge_reset_mode,
+                )
             return False
         except Exception:
             if self.logger:

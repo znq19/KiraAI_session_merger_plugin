@@ -22,6 +22,12 @@ class HistoryToolService:
     # 连续失败 N 次后进入熔断，直接返回错误不再打 HTTP
     CIRCUIT_FAIL_THRESHOLD = 2
     CIRCUIT_OPEN_SEC = 120.0
+    # 同一 agent 回合内：同一目标会话最多成功返回几次（再调用直接拒绝，不塞大段历史）
+    MAX_CALLS_PER_TARGET_PER_EVENT = 1
+    # 同一 agent 回合内：历史工具总调用上限（含被拒绝的）
+    MAX_CALLS_PER_EVENT = 2
+    # 单次返回正文最大字符，避免 tool_result 把上下文撑爆
+    MAX_RESULT_CHARS = 3500
 
     def __init__(
         self,
@@ -152,12 +158,60 @@ class HistoryToolService:
         data = cached["data"]
         if is_error:
             return data
+        # 缓存命中：只回短拒，不再把整段历史塞进 tool_result（否则每步 +数千 token）
         return (
-            data
-            + "\n\n---\n⚠️ 系统提示：检测到重复查询同一会话。"
-            "以上是已获取的完整历史消息，请直接基于此内容进行总结或回复，"
-            "**请勿再次调用 get_session_history 工具**。"
+            "Rejected: 该会话历史本回合已查询过（结果在上文 tool 记录中）。"
+            "请直接基于当前对话上下文回复，禁止再次调用 get_session_history。"
         )
+
+    @staticmethod
+    def _event_extra(event) -> dict:
+        try:
+            extra = getattr(event, "extra", None)
+            if not isinstance(extra, dict):
+                extra = {}
+                try:
+                    event.extra = extra
+                except Exception:
+                    return {}
+            return extra
+        except Exception:
+            return {}
+
+    def _track_and_limit(self, event, target_key: str) -> Optional[str]:
+        """
+        同一 KiraMessageBatchEvent（一次 agent 回合）内限制历史工具调用。
+        返回非 None 则应直接 return 该字符串，不再打 HTTP。
+        """
+        extra = self._event_extra(event)
+        total = int(extra.get("merger_hist_total", 0) or 0)
+        by_target = extra.get("merger_hist_by_target")
+        if not isinstance(by_target, dict):
+            by_target = {}
+            extra["merger_hist_by_target"] = by_target
+
+        if total >= self.MAX_CALLS_PER_EVENT:
+            return (
+                "Rejected: 本回合 get_session_history 调用次数已达上限。"
+                "请直接回复，禁止再查历史。"
+            )
+        n = int(by_target.get(target_key, 0) or 0)
+        if n >= self.MAX_CALLS_PER_TARGET_PER_EVENT:
+            return (
+                f"Rejected: 本回合已查询过 {target_key} 的历史。"
+                "请直接基于上下文回复，禁止再次 get_session_history。"
+            )
+
+        by_target[target_key] = n + 1
+        extra["merger_hist_total"] = total + 1
+        return None
+
+    def _truncate_result(self, text: str) -> str:
+        if not text or len(text) <= self.MAX_RESULT_CHARS:
+            return text
+        # 保留末尾（更新）
+        cut = text[-self.MAX_RESULT_CHARS :]
+        return "…(truncated older)…\n" + cut
 
     def _note_failure(self):
         self._fail_streak += 1
@@ -190,6 +244,8 @@ class HistoryToolService:
         session_id: str,
         count: int = 20,
         session_type: Optional[str] = None,
+        *,
+        merge_enabled: bool = False,
     ) -> str:
         try:
             blocked = self._circuit_blocked()
@@ -211,12 +267,20 @@ class HistoryToolService:
                 count = int(count)
             except Exception:
                 count = 20
+            # 与 history_plugin 对齐：最少 5，最多 80，默认 20
             if count < 5:
                 count = 5
             elif count > 80:
                 count = 80
 
             cache_key = f"{st}:{entity}"
+            target_key = cache_key
+
+            # 本回合调用次数硬限制（在缓存命中之前也计数，防止刷拒绝）
+            limited = self._track_and_limit(event, target_key)
+            if limited:
+                return limited
+
             hit = self._cache_get_hit(cache_key, count)
             if hit is not None:
                 return hit
@@ -283,7 +347,7 @@ class HistoryToolService:
                 content = self._message_to_text(msg)
                 formatted.append(f"{sender}: {content}")
 
-            result_text = "\n".join(formatted)
+            result_text = self._truncate_result("\n".join(formatted))
             self._cache_put(cache_key, count, result_text, is_error=False)
             self._note_success()
             return result_text
