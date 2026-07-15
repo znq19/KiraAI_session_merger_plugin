@@ -1,6 +1,6 @@
 {
   "plugin_id": "kira_session_merger",
-  "display_name": "会话合并",
+  "display_name": "会话合并与互通",
   "version": "2.0.0",
   "author": "KiraAI",
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。",
@@ -11,7 +11,7 @@
   "tags": ["memory", "session"],
   "locales": {
     "zh": {
-      "display_name": "会话合并",
+      "display_name": "会话合并与互通",
       "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。"
     }
   }
