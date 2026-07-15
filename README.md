@@ -1,4 +1,4 @@
-# 会话合并 · kira_session_merger（KSM）
+# 会话合并与互通 · kira_session_merger（KSM）
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
