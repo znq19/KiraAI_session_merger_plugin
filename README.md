@@ -1,5 +1,5 @@
 # 会话合并 · kira_session_merger（KSM）
-
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 **版本 2.0.0** · 适用于 [KiraAI](https://github.com/) `core >= 2.6.1`
 
 > 让 AI 在不同群聊、私聊里**真的是同一个人**——记得跨会话的经历，又能分清「现在在跟谁聊」。
