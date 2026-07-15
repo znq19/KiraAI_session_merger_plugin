@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +26,7 @@ from .cross_session import (
     mark_event_handoff,
     route_cross_session_request,
 )
+from .group_agent_queue import GroupAgentQueue
 from .group_resolver import GroupResolver
 from .history_tool import HistoryToolService
 from .merge_engine import MergeEngine
@@ -71,9 +73,9 @@ class SessionMergerPlugin(BasePlugin):
         self.peek_max_messages = 3
         self.include_tool_traces = True
         self.drop_unpaired_tools = True
-        self.prefer_official_content = True
         self.source_tag_mode = "prefix"
         self.cross_session_time_order = True
+        self.merge_build_timeout_sec = 5.0
 
 
         # anchor
@@ -92,11 +94,34 @@ class SessionMergerPlugin(BasePlugin):
         self.cache_ttl_sec = 120
 
         # commands
-        self.enable_status_command = True
+        self.enable_status_command = False
         self.status_commands: List[str] = ["/merge s", "/合并状态"]
         self.enable_preview_command = False
         self.preview_commands: List[str] = ["/merge p", "/合并预览"]
         self.command_allowed_users: List[str] = []
+
+        # reboot all (参考 reboot_plugin)
+        self.enable_reboot_all_command = True
+        self.reboot_all_commands: List[str] = ["/reboota"]
+        self.reboot_all_enable_permission = False
+        self.reboot_all_allowed_users: List[str] = []
+        self.reboot_all_success_message = (
+            "✅ 已清除全部合并会话的上下文记忆（共 {count} 个），我们可以重新开始对话了！"
+        )
+        self.reboot_all_permission_denied_message = (
+            "❌ 权限不足：您没有全部重启合并会话的权限"
+        )
+        self.reboot_all_error_message = "❌ 全部重启失败: {error}"
+
+        # 合并组单一 agent 队列（逻辑一个窗口）
+        self.enable_group_agent_queue = True
+        self.group_agent_lock_ttl_sec = 180
+        self.group_agent_settle_sec = 0.4
+        self.group_agent_max_queue = 32
+        self.group_queue: Optional[GroupAgentQueue] = None
+        self._memory_write_wrapped = False
+        self._orig_update_memory = None
+        self._drain_tasks: Dict[str, asyncio.Task] = {}
 
         # debug
         self.enable_debug_log = False
@@ -111,8 +136,8 @@ class SessionMergerPlugin(BasePlugin):
         self.session_send_dedup_sec = 25
         self._session_send_wrapped = False
         # 包装版本：升级后强制重装，避免热重载残留「直达」旧包装
-        # 8 = 交棒 stop + 中性 tip + 仅 merger 侧停 QQ typing（不改 core/增强源码）
-        self._SESSION_SEND_WRAP_VERSION = 8
+        # 9 = 同会话拒绝文案 + description/tip 收紧（当前会话直接 xml）
+        self._SESSION_SEND_WRAP_VERSION = 9
 
 
 
@@ -183,10 +208,25 @@ class SessionMergerPlugin(BasePlugin):
         self.peek_max_messages = int(ctx_sec.get("peek_max_messages", 3) or 3)
         self.include_tool_traces = bool(ctx_sec.get("include_tool_traces", True))
         self.drop_unpaired_tools = bool(ctx_sec.get("drop_unpaired_tools", True))
-        self.prefer_official_content = bool(ctx_sec.get("prefer_official_content", True))
         self.source_tag_mode = str(ctx_sec.get("source_tag_mode", "prefix") or "prefix")
         self.cross_session_time_order = bool(ctx_sec.get("cross_session_time_order", True))
-        self.session_send_dedup_sec = int(ctx_sec.get("session_send_dedup_sec", 25) or 0)
+        self.merge_build_timeout_sec = float(
+            ctx_sec.get("merge_build_timeout_sec", 5.0) or 5.0
+        )
+        if self.merge_build_timeout_sec < 1.0:
+            self.merge_build_timeout_sec = 1.0
+        # 优先 section_mode；兼容旧配置写在 section_context
+        mode_for_dedup = cfg.get("section_mode") or {}
+        if not isinstance(mode_for_dedup, dict):
+            mode_for_dedup = {}
+        if "session_send_dedup_sec" in mode_for_dedup:
+            self.session_send_dedup_sec = int(
+                mode_for_dedup.get("session_send_dedup_sec", 25) or 0
+            )
+        else:
+            self.session_send_dedup_sec = int(
+                ctx_sec.get("session_send_dedup_sec", 25) or 0
+            )
 
         if self.session_send_dedup_sec < 0:
             self.session_send_dedup_sec = 0
@@ -223,7 +263,7 @@ class SessionMergerPlugin(BasePlugin):
         self.cache_ttl_sec = int(hist.get("cache_ttl_sec", 30))
 
         cmd = cfg.get("section_command", {})
-        self.enable_status_command = bool(cmd.get("enable_status_command", True))
+        self.enable_status_command = bool(cmd.get("enable_status_command", False))
         sc = cmd.get("status_commands", cmd.get("status_command", ["/merge s", "/合并状态"]))
         if isinstance(sc, str):
             sc = [sc]
@@ -237,6 +277,63 @@ class SessionMergerPlugin(BasePlugin):
         if isinstance(cau, str):
             cau = [cau]
         self.command_allowed_users = [str(u).strip() for u in (cau or []) if str(u).strip()]
+
+        self.enable_reboot_all_command = bool(cmd.get("enable_reboot_all_command", True))
+        rac = cmd.get("reboot_all_commands", cmd.get("reboot_all_command", ["/reboota"]))
+        if isinstance(rac, str):
+            rac = [rac]
+        self.reboot_all_commands = [str(x).strip() for x in (rac or []) if str(x).strip()]
+        if not self.reboot_all_commands:
+            self.reboot_all_commands = ["/reboota"]
+        self.reboot_all_enable_permission = bool(
+            cmd.get("reboot_all_enable_permission", False)
+        )
+        rau = cmd.get("reboot_all_allowed_users", [])
+        if isinstance(rau, str):
+            rau = [x.strip() for x in rau.split(",") if x.strip()]
+        self.reboot_all_allowed_users = [
+            str(u).strip() for u in (rau or []) if str(u).strip()
+        ]
+        self.reboot_all_success_message = str(
+            cmd.get(
+                "reboot_all_success_message",
+                "✅ 已清除全部合并会话的上下文记忆（共 {count} 个），我们可以重新开始对话了！",
+            )
+            or "✅ 已清除全部合并会话的上下文记忆（共 {count} 个），我们可以重新开始对话了！"
+        )
+        self.reboot_all_permission_denied_message = str(
+            cmd.get(
+                "reboot_all_permission_denied_message",
+                "❌ 权限不足：您没有全部重启合并会话的权限",
+            )
+            or "❌ 权限不足：您没有全部重启合并会话的权限"
+        )
+        self.reboot_all_error_message = str(
+            cmd.get("reboot_all_error_message", "❌ 全部重启失败: {error}")
+            or "❌ 全部重启失败: {error}"
+        )
+
+        # 组级 agent 队列（独立分组；兼容旧配置写在 section_context 的情况）
+        q_sec = cfg.get("section_group_agent_queue") or {}
+        ctx_legacy = cfg.get("section_context") or {}
+        if not isinstance(q_sec, dict):
+            q_sec = {}
+        if not isinstance(ctx_legacy, dict):
+            ctx_legacy = {}
+
+        def _q_get(key, default):
+            if key in q_sec:
+                return q_sec.get(key)
+            return ctx_legacy.get(key, default)
+
+        self.enable_group_agent_queue = bool(_q_get("enable_group_agent_queue", True))
+        self.group_agent_lock_ttl_sec = int(
+            _q_get("group_agent_lock_ttl_sec", 180) or 180
+        )
+        self.group_agent_settle_sec = float(
+            _q_get("group_agent_settle_sec", 0.4) or 0.0
+        )
+        self.group_agent_max_queue = int(_q_get("group_agent_max_queue", 32) or 32)
 
         debug = cfg.get("section_debug", {})
         self.enable_debug_log = bool(debug.get("enable_debug_log", False))
@@ -263,7 +360,6 @@ class SessionMergerPlugin(BasePlugin):
             chars_per_token=self.chars_per_token,
             include_tool_traces=self.include_tool_traces,
             drop_unpaired_tools=self.drop_unpaired_tools,
-            prefer_official_content=self.prefer_official_content,
             cross_session_time_order=self.cross_session_time_order,
             debug=self.enable_debug_log,
             logger=logger,
@@ -296,6 +392,7 @@ class SessionMergerPlugin(BasePlugin):
             source_tag_mode=self.source_tag_mode,
             enable_window_anchor=self.enable_window_anchor,
             window_anchor_prompt=self.window_anchor_prompt,
+            merge_build_timeout_sec=self.merge_build_timeout_sec,
             debug=self.enable_debug_log,
             log_preview=self.log_merged_message_preview,
             logger=logger,
@@ -332,7 +429,7 @@ class SessionMergerPlugin(BasePlugin):
 
         logger.info(
             "会话合并初始化 enabled=%s mode=%s max_sessions=%d chunks=%d "
-            "token_limit=%d keep=%d timeout=%dm peek=%.3f",
+            "token_limit=%d keep=%d timeout=%dm peek=%.3f group_queue=%s",
             self.enabled,
             self.merge_reset_mode,
             self.max_merge_sessions,
@@ -341,6 +438,7 @@ class SessionMergerPlugin(BasePlugin):
             self.merge_keep_turns,
             self.other_session_timeout,
             self.unmentioned_probability,
+            self.enable_group_agent_queue,
         )
 
     @on.loaded()
@@ -448,8 +546,10 @@ class SessionMergerPlugin(BasePlugin):
 
             if source and source == target:
                 return (
-                    "Do not session_send to the current session; "
-                    "output xml / use tools directly here."
+                    "Do not session_send to the current session; output xml directly here. "
+                    "If a tool already returned an attachment path, send it with "
+                    '<file type="record|image|file">path</file> in <msg>; '
+                    "do not call session_send again for this session."
                 )
 
             ttl = float(getattr(plugin, "session_send_dedup_sec", 0) or 0)
@@ -499,7 +599,8 @@ class SessionMergerPlugin(BasePlugin):
                 fn = td.get("function") or {}
                 if fn.get("name") == "session_send":
                     fn["description"] = (
-                        "【合并模式·跨会话请求】切换到目标会话，在目标会话带着合并上文继续执行。"
+                        "【合并模式·跨会话请求】切换到目标会话，带着合并上文继续执行。"
+                        "仅当 target ≠ 当前会话时使用；当前会话请直接输出 xml。"
                         "用户说「去群里/去私聊/到某会话聊」或任务应在另一会话完成时，应主动调用。"
                         "target 如 qq:dm:123 / qq:gm:456（可从会话列表复制）。"
                         "成功后任务交给目标会话；不要在源会话替目标执行业务工具；"
@@ -533,14 +634,215 @@ class SessionMergerPlugin(BasePlugin):
                 self.observe_pool.flush(force=True)
             except Exception:
                 pass
+        self._unwrap_update_memory()
+        if self.group_queue:
+            try:
+                self.group_queue.clear_all()
+            except Exception:
+                pass
+        for t in list(self._drain_tasks.values()):
+            if t and not t.done():
+                t.cancel()
+        self._drain_tasks.clear()
         # 尽量恢复 session_send（若仍指向我们的包装则无法还原原函数，热重载会重建）
         self.engine = None
         self.timeline = None
         self.resolver = None
         self.history_svc = None
         self.observe_pool = None
+        self.group_queue = None
         self._session_send_wrapped = False
         logger.info("会话合并已终止")
+
+    # ── 组级 agent 队列：wrap 落盘 + 串行调度 ─────────────────
+
+    def _wrap_update_memory(self):
+        """在官方 update_memory 之后释放组锁并调度队列（等落盘）。"""
+        sm = getattr(self.ctx, "session_mgr", None)
+        if not sm or not hasattr(sm, "update_memory"):
+            return
+        if getattr(sm.update_memory, "_merger_memory_wrapped", False):
+            self._memory_write_wrapped = True
+            return
+        if self._orig_update_memory is None:
+            self._orig_update_memory = sm.update_memory
+
+        plugin = self
+        orig = self._orig_update_memory
+
+        def wrapped_update_memory(session, new_chunk, *args, **kwargs):
+            result = orig(session, new_chunk, *args, **kwargs)
+            try:
+                if plugin.enabled and plugin.group_queue and plugin.resolver:
+                    sid = str(session or "")
+                    gid = plugin.resolver.resolve_group_id(sid)
+                    if gid:
+                        # 同步钩子里调度异步 drain
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(
+                                plugin._on_group_memory_written(sid, gid)
+                            )
+                        except RuntimeError:
+                            pass
+            except Exception:
+                logger.exception("[MERGER queue] post update_memory hook failed")
+            return result
+
+        wrapped_update_memory._merger_memory_wrapped = True  # type: ignore
+        sm.update_memory = wrapped_update_memory
+        self._memory_write_wrapped = True
+        logger.info("[MERGER queue] session_mgr.update_memory wrapped (release after disk write)")
+
+    def _unwrap_update_memory(self):
+        sm = getattr(self.ctx, "session_mgr", None)
+        if not sm or not self._orig_update_memory:
+            return
+        try:
+            if getattr(sm.update_memory, "_merger_memory_wrapped", False):
+                sm.update_memory = self._orig_update_memory
+        except Exception:
+            pass
+        self._memory_write_wrapped = False
+
+    async def _on_group_memory_written(self, sid: str, group_id: str):
+        if not self.group_queue:
+            return
+        await self.group_queue.on_memory_written(
+            sid, group_id, schedule_fn=self._schedule_group_drain
+        )
+
+    async def _schedule_group_drain(self, group_id: str):
+        """落盘后 settle，再取出队首重放 batch。"""
+        old = self._drain_tasks.get(group_id)
+        if old and not old.done():
+            return
+
+        async def _run():
+            try:
+                settle = float(self.group_agent_settle_sec or 0)
+                if settle > 0:
+                    await asyncio.sleep(settle)
+                await self._drain_group_queue(group_id)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("[MERGER queue] drain failed group=%s", group_id)
+            finally:
+                self._drain_tasks.pop(group_id, None)
+
+        self._drain_tasks[group_id] = asyncio.create_task(_run())
+
+    async def _drain_group_queue(self, group_id: str):
+        if not self.group_queue or not self.enabled:
+            return
+        pending = await self.group_queue.pop_next_and_begin(group_id)
+        if not pending:
+            return
+
+        try:
+            batch = KiraMessageBatchEvent(
+                message_types=pending.message_types or [],
+                timestamp=int(time.time()),
+                adapter=pending.adapter,
+                session=pending.session,
+                messages=list(pending.messages),
+            )
+            self.group_queue.authorize_event(batch.event_id)
+            bus = getattr(self.ctx, "event_bus", None)
+            if bus is None:
+                logger.error(
+                    "[MERGER queue] no event_bus; cannot replay sid=%s",
+                    pending.sid,
+                )
+                await self.group_queue.force_release(
+                    group_id, "no_event_bus", schedule_fn=self._schedule_group_drain
+                )
+                return
+
+            logger.info(
+                "[MERGER queue] replay batch sid=%s group=%s msgs=%d event=%s",
+                pending.sid,
+                group_id,
+                len(pending.messages),
+                batch.event_id,
+            )
+            await bus.publish(batch)
+        except Exception:
+            logger.exception(
+                "[MERGER queue] replay failed sid=%s group=%s",
+                pending.sid,
+                group_id,
+            )
+            await self.group_queue.force_release(
+                group_id, "replay_error", schedule_fn=self._schedule_group_drain
+            )
+
+    async def _release_group_for_event(self, event, reason: str) -> bool:
+        """
+        补充释放：仅当本 event 持有组锁且 agent 不会再跑到 update_memory 时调用。
+        正常跑完仍以 update_memory 为主路径（等落盘后再调度）。
+        """
+        if not self.enabled or not self.group_queue or not self.resolver:
+            return False
+        if not self.enable_group_agent_queue:
+            return False
+        try:
+            sid = getattr(event, "sid", None) or ""
+            eid = str(getattr(event, "event_id", "") or "")
+            if not sid:
+                return False
+            gid = self.resolver.resolve_group_id(sid)
+            if not gid:
+                return False
+            return await self.group_queue.release_if_active(
+                gid,
+                sid=sid,
+                event_id=eid,
+                reason=reason,
+                schedule_fn=self._schedule_group_drain,
+            )
+        except Exception:
+            logger.exception("[MERGER queue] release_for_event failed reason=%s", reason)
+            return False
+
+    @on.im_batch_message(priority=Priority.LOW)
+    async def on_im_batch_group_queue(self, event: KiraMessageBatchEvent):
+        """
+        合并组串行：组内已有 agent 时，本 batch 入队并 stop，
+        等当前会话 update_memory 后再重放（Q1，接近官方单窗口）。
+
+        使用 LOW：core 在 is_stopped 后不再跑后续 handler。
+        若用 HIGH 占锁后被其它插件 stop，会既不进 agent 也不 update_memory，
+        只能干等 TTL。LOW 保证「只有 batch 仍将继续时才占锁」。
+        """
+        if not self.enabled or not self.group_queue or not self.resolver:
+            return
+        if not self.enable_group_agent_queue:
+            return
+        if event.is_stopped:
+            return
+        try:
+            sid = getattr(event, "sid", None) or ""
+            if not sid:
+                return
+            # 跨会话 ROUTE 注入的 batch 也走同一组锁，保证一条线
+            gid = self.resolver.resolve_group_id(sid)
+            if not gid:
+                return
+            ok = await self.group_queue.try_begin(gid, sid, event)
+            if not ok:
+                event.stop()
+                logger.info(
+                    "[MERGER queue] deferred batch sid=%s group=%s event=%s",
+                    sid,
+                    gid,
+                    getattr(event, "event_id", ""),
+                )
+        except Exception:
+            logger.exception("[MERGER queue] on_im_batch failed")
+
+
 
 
     # ── helpers ──────────────────────────────────────────────
@@ -559,6 +861,26 @@ class SessionMergerPlugin(BasePlugin):
         except Exception:
             return True
 
+    def _get_event_user_id(self, event: KiraMessageEvent) -> str:
+        try:
+            return str(event.message.sender.user_id)
+        except Exception:
+            return "unknown"
+
+    def _get_event_user_name(self, event: KiraMessageEvent) -> str:
+        try:
+            return event.message.sender.nickname or "未知"
+        except Exception:
+            return "未知"
+
+    def _reboot_all_user_allowed(self, event: KiraMessageEvent) -> bool:
+        """参考 reboot_plugin：未开权限 / 白名单为空 → 放行。"""
+        if not self.reboot_all_enable_permission:
+            return True
+        if not self.reboot_all_allowed_users:
+            return True
+        return self._get_event_user_id(event) in self.reboot_all_allowed_users
+
     def _match_command(self, text: str, commands: List[str]) -> bool:
         if not text or not commands:
             return False
@@ -567,6 +889,31 @@ class SessionMergerPlugin(BasePlugin):
             if t == str(c).strip().lower():
                 return True
         return False
+
+    def _collect_all_merge_sids(self) -> List[str]:
+        """收集所有参与合并的会话 sid（去重）。"""
+        if not self.resolver:
+            return []
+        seen = set()
+        ordered: List[str] = []
+        try:
+            for g in self.resolver.summarize() or []:
+                for sid in g.get("members") or []:
+                    s = str(sid).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        ordered.append(s)
+        except Exception:
+            logger.exception("[MERGER] collect merge sids failed")
+        return ordered
+
+    def _clear_session_context(self, sid: str) -> bool:
+        """清除单个会话上下文（对齐 reboot_plugin：delete_session）。"""
+        sm = getattr(self.ctx, "session_mgr", None)
+        if sm is None or not sid:
+            return False
+        sm.delete_session(sid)
+        return True
 
     async def _reply(self, sid: str, text: str):
         await self.ctx.message_processor.send_message_chain(
@@ -721,6 +1068,111 @@ class SessionMergerPlugin(BasePlugin):
             event.stop()
             return
 
+        if self.enable_reboot_all_command and self._match_command(
+            text, self.reboot_all_commands
+        ):
+            await self._handle_reboot_all(event, sid)
+            event.discard(force=True)
+            event.stop()
+            return
+
+    async def _handle_reboot_all(self, event: KiraMessageEvent, sid: str):
+        """清除所有参与合并的会话上下文（参考 reboot_plugin）。"""
+        user_id = self._get_event_user_id(event)
+        user_name = self._get_event_user_name(event)
+
+        if self.enable_debug_log:
+            logger.info(
+                "[MERGER] reboot_all cmd | user=%s(%s) | from=%s",
+                user_name,
+                user_id,
+                sid,
+            )
+
+        if not self._reboot_all_user_allowed(event):
+            if self.enable_debug_log:
+                logger.info("[MERGER] reboot_all denied user=%s", user_id)
+            await self._reply(sid, self.reboot_all_permission_denied_message)
+            return
+
+        try:
+            if getattr(self.ctx, "session_mgr", None) is None:
+                await self._reply(
+                    sid,
+                    self.reboot_all_error_message.format(error="会话管理器不可用"),
+                )
+                return
+
+            targets = self._collect_all_merge_sids()
+            if not targets:
+                await self._reply(
+                    sid,
+                    self.reboot_all_success_message.format(count=0),
+                )
+                return
+
+            ok_count = 0
+            fail_count = 0
+            for target_sid in targets:
+                try:
+                    if self._clear_session_context(target_sid):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.error(
+                        "[MERGER] reboot_all delete failed sid=%s: %s",
+                        target_sid,
+                        e,
+                    )
+
+            # 软重启动态 keep / 跨会话去重一并清掉
+            try:
+                if self.engine and getattr(self.engine, "_soft_state", None):
+                    self.engine._soft_state._dynamic_keep.clear()
+                    self.engine._soft_state._last_reset.clear()
+                    self.engine._soft_state._last_check.clear()
+            except Exception:
+                pass
+            try:
+                self._session_send_dedup.clear()
+            except Exception:
+                pass
+
+            # 观察池一并清空（未点名缓存）
+            try:
+                if self.observe_pool and hasattr(self.observe_pool, "clear"):
+                    self.observe_pool.clear()
+                elif self.observe_pool and hasattr(self.observe_pool, "_data"):
+                    self.observe_pool._data.clear()
+            except Exception:
+                pass
+            try:
+                if self.group_queue:
+                    self.group_queue.clear_all()
+            except Exception:
+                pass
+
+            msg = self.reboot_all_success_message.format(count=ok_count)
+            if fail_count:
+                msg = f"{msg}\n（失败 {fail_count} 个）"
+            await self._reply(sid, msg)
+            logger.warning(
+                "[MERGER] reboot_all done by %s(%s): ok=%d fail=%d total=%d",
+                user_name,
+                user_id,
+                ok_count,
+                fail_count,
+                len(targets),
+            )
+        except Exception as e:
+            logger.error("[MERGER] reboot_all failed: %s", e)
+            await self._reply(
+                sid,
+                self.reboot_all_error_message.format(error=str(e)),
+            )
+
     async def _handle_status(self, sid: str):
         if not self.resolver or not self.engine:
             await self._reply(sid, "合并引擎未初始化")
@@ -840,17 +1292,17 @@ class SessionMergerPlugin(BasePlugin):
         try:
             tip2 = (
                 "\n[Session Merger] session_send = 跨会话请求（合并模式）："
-                "切换到目标会话，目标会带着合并上文自己思考并调工具。\n"
-                "### 何时应主动 session_send\n"
-                "- 用户说「去群里聊 / 到群xxx / 去私聊 / 私聊我 / 到那边发」等换会话意图\n"
-                "- 任务应在另一会话完成（如到私聊发卡、到某群发言）且用户要求在那边做\n"
-                "行为：先 session_send(target, description=要在目标完成的事)；"
-                "成功后不要在源会话替目标调业务工具（搜歌/发卡等）；"
-                "有必要时可在本会话发一句简短确认，也可以不发；"
-                "同一 target 成功路由一次即可。\n"
-                "### 不必路由\n"
-                "- 只是提起其他会话往事（「记得群里说过」）→ 直接在本会话回答\n"
-                "- 目标就是当前会话 → 直接输出 xml / 调工具\n"
+                "切换到目标会话，目标带着合并上文继续执行。\n"
+                "### 何时应 session_send\n"
+                "- 用户要求换会话，或任务须在另一会话完成\n"
+                "### 行为\n"
+                "- session_send(target, description=要在目标完成的事)；"
+                "成功后勿在源会话替目标调业务工具；可简短确认也可不发；同一 target 一次即可\n"
+                "### 不要 session_send\n"
+                "- 目标就是当前会话 → 直接输出 xml / 在本会话调工具\n"
+                "### get_session_history\n"
+                "- 近期合并上下文已注入；需要更早平台真历史时再查；"
+                "同一目标每回合最多 1 次；Rejected 后停止再查\n"
             )
             for p in req.system_prompt or []:
                 if getattr(p, "name", None) == "tools":
@@ -876,6 +1328,10 @@ class SessionMergerPlugin(BasePlugin):
                 )
         except Exception:
             logger.exception("[session_merger] apply_to_request failed (swallowed)")
+
+        # 本阶段已被 stop、不会进 agent/update_memory 时补放组锁
+        if event.is_stopped:
+            await self._release_group_for_event(event, "llm_request_stopped_no_agent")
 
     # ── 源会话交棒：仅停止「当前这条」agent 回合 ─────────────
     # event.stop() 作用在 KiraMessageBatchEvent 实例上，不锁会话、
@@ -1007,10 +1463,10 @@ class SessionMergerPlugin(BasePlugin):
     @register.tool(
         name="get_session_history",
         description=(
-            "Fetch recent messages from a group or private chat via OneBot HTTP, "
-            "including image URLs as [图片](url) and message IDs as (msg_id:数字). "
-            "session_id: qq:gm:群号 / qq:dm:QQ号, or bare id with session_type. "
-            "If the tool returns Error/Failed, do NOT call it again; answer from current context."
+            "通过 OneBot HTTP 拉取群/私聊平台真历史（含更早记录、msg_id、图片 URL）。"
+            "合并模式下近期上下文已注入：仅当需要更早/平台侧记录时再查；"
+            "同一目标每回合最多成功查 1 次，返回 Rejected/Error 后禁止再调。"
+            "session_id：qq:gm:群号 / qq:dm:QQ号。"
         ),
         params={
             "type": "object",
@@ -1026,7 +1482,7 @@ class SessionMergerPlugin(BasePlugin):
                 },
                 "session_type": {
                     "type": "string",
-                    "description": "可选：group/private/gm/dm；当 session_id 为纯数字时使用",
+                    "description": "可选：group/private/gm/dm；session_id 为纯数字时使用",
                 },
             },
             "required": ["session_id"],
@@ -1049,6 +1505,7 @@ class SessionMergerPlugin(BasePlugin):
             session_id=session_id,
             count=count,
             session_type=session_type or None,
+            merge_enabled=bool(self.enabled),
         )
 
     @on.after_xml_parse(priority=Priority.HIGH)
