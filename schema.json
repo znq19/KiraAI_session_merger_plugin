@@ -1,0 +1,375 @@
+{
+  "section_info": {
+    "type": "section",
+    "name": "说明",
+    "collapsed": false,
+    "fields": {
+      "about": {
+        "type": "info",
+        "name": "功能说明",
+        "level": "info",
+        "hint": "将会话合并为同一条对话时间线，使 AI 在不同群聊/私聊中保持同一身份与连续记忆。各会话的官方原版聊天记录仍分别保存；本插件在请求模型前合并读取。未唤醒的消息可进入观察池，按概率「偷看」。短期记忆过长时，默认采用「软重启」（只缩短本次合并轮数）；可选「硬重开」会改写合并组内各会话的记录但可统一释放token，请谨慎开启。"
+      }
+    }
+  },
+  "section_mode": {
+    "type": "section",
+    "name": "合并范围",
+    "collapsed": false,
+    "fields": {
+      "enabled": {
+        "type": "switch",
+        "name": "启用会话合并",
+        "default": false,
+        "hint": "关闭时本插件不合并上下文，也不记录未点名消息。"
+      },
+      "allowed_adapters": {
+        "type": "list",
+        "name": "允许的适配器",
+        "default": ["qq"],
+        "hint": "只合并这些适配器下的会话。一般填 qq。留空表示不限制适配器。"
+      },
+      "merge_all_groups": {
+        "type": "switch",
+        "name": "合并所有群聊",
+        "default": true,
+        "hint": "开启后，允许适配器下的群聊会参与合并。"
+      },
+      "merge_all_dms": {
+        "type": "switch",
+        "name": "合并所有私聊",
+        "default": true,
+        "hint": "开启后，允许适配器下的私聊会参与合并。"
+      },
+      "merge_groups_with_dms": {
+        "type": "switch",
+        "name": "群聊与私聊互通",
+        "default": true,
+        "hint": "开启：群聊与私聊合并。关闭：群一组、私一组，互不合并。注意：本开关不自动合并所有，具体范围仍由「合并所有群聊/私聊」与「额外会话」决定。"
+      },
+      "max_merge_sessions": {
+        "type": "integer",
+        "name": "最大合并会话数",
+        "default": 8,
+        "minimum": 1,
+        "maximum": 50,
+        "hint": "一次请求最多带几个会话的记忆（含当前会话）。当前会话一定保留，其余按最近活跃挑选。数值越大越全，也越费 token。"
+      },
+      "extra_sessions": {
+        "type": "list",
+        "name": "额外会话",
+        "default": [],
+        "hint": "强制加入合并的会话 ID，每行一个。格式：qq:gm:群号 或 qq:dm:QQ号。"
+      },
+      "exclude_sessions": {
+        "type": "list",
+        "name": "排除会话",
+        "default": [],
+        "hint": "不参与合并的会话 ID，每行一个。格式同上。"
+      }
+    }
+  },
+  "section_context": {
+    "type": "section",
+    "name": "上下文与软硬重启",
+    "collapsed": false,
+    "fields": {
+      "max_merged_chunks": {
+        "type": "integer",
+        "name": "最大合并轮数",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 100,
+        "hint": "合并后最多先取最近多少「轮」对话发给模型。一轮 ≈ 用户一条 + AI 后续回复/工具。对应官方单会话记忆轮数量级（常见默认 10）。"
+      },
+      "merge_token_limit": {
+        "type": "integer",
+        "name": "合并历史 token 上限",
+        "default": 30000,
+        "minimum": 1000,
+        "maximum": 200000,
+        "hint": "只统计「合并后的短期聊天记录」估算 token（不含人设等系统提示）。超过则触发软重启或硬重开，只保留下方「超限保留轮数」。"
+      },
+      "merge_keep_turns": {
+        "type": "integer",
+        "name": "超限保留轮数",
+        "default": 6,
+        "minimum": 1,
+        "maximum": 50,
+        "hint": "合并历史超 token 上限后，只保留最近这么多轮。连续多次超限会自动减半（最少 1 轮），避免完全失忆。"
+      },
+      "merge_reset_mode": {
+        "type": "enum",
+        "name": "超限处理模式",
+        "options": ["soft", "hard"],
+        "default": "soft",
+        "hint": "soft：只缩短本次合并视图，不删各会话独立记录。hard：合并组内相关会话按 ADS 方式删除并写回最近保留轮数，具有破坏性；开启 hard 时会自动关闭 ADS 以免冲突。"
+      },
+      "merge_check_interval_sec": {
+        "type": "integer",
+        "name": "超限检测间隔（秒）",
+        "default": 60,
+        "minimum": 0,
+        "maximum": 3600,
+        "hint": "同一合并组两次「超限判定/降级」的最小间隔。0 表示每次请求都检测。用于避免过于频繁地减半保留轮数。"
+      },
+      "chars_per_token": {
+        "type": "float",
+        "name": "每 token 约多少字符",
+        "default": 2.0,
+        "minimum": 1.0,
+        "maximum": 10.0,
+        "hint": "用「字符数 ÷ 该值」估算 token，中文场景 1.5～2.5 较常见。仅用于超限判断，不是精确计费。"
+      },
+      "other_session_timeout": {
+        "type": "integer",
+        "name": "其他会话超时（分钟）",
+        "default": 20,
+        "minimum": 0,
+        "maximum": 1440,
+        "hint": "其他会话超过该时间未活跃，则不再并入上下文。0 表示不因超时排除。当前正在聊的会话始终保留。"
+      },
+      "other_session_timeout_private": {
+        "type": "integer",
+        "name": "私聊超时（分钟）",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 1440,
+        "hint": "私聊专用超时。0 表示使用上面的「其他会话超时」。"
+      },
+      "other_session_timeout_group": {
+        "type": "integer",
+        "name": "群聊超时（分钟）",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 1440,
+        "hint": "群聊专用超时。0 表示使用上面的「其他会话超时」。"
+      },
+      "unmentioned_probability": {
+        "type": "float",
+        "name": "未点名消息偷看概率",
+        "default": 0.01,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "从观察池随机塞入未 @/未唤醒原文的概率。0 关闭。偷看内容带 [msg_type: peek] 标记，且同样受超时限制。"
+      },
+      "max_observe_per_session": {
+        "type": "integer",
+        "name": "每会话观察池条数",
+        "default": 20,
+        "minimum": 1,
+        "maximum": 200,
+        "hint": "每个会话最多缓存多少条「未点名」消息，供偷看使用。"
+      },
+      "peek_max_messages": {
+        "type": "integer",
+        "name": "单次偷看最多条数",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 20,
+        "hint": "触发偷看时，最多注入几条未点名原文。"
+      },
+      "include_tool_traces": {
+        "type": "switch",
+        "name": "保留工具调用过程",
+        "default": true,
+        "hint": "开启后，合并历史里会带上 AI 调工具的步骤与结果，更像完整经历；关闭可略省 token。"
+      },
+      "drop_unpaired_tools": {
+        "type": "switch",
+        "name": "丢弃残缺工具记录",
+        "default": true,
+        "hint": "自动去掉对不齐的工具调用/结果，减少模型重复乱调工具。"
+      },
+      "prefer_official_content": {
+        "type": "switch",
+        "name": "保留官方消息原文",
+        "default": true,
+        "hint": "尽量不改写官方记录里的原文（含消息 ID、图片说明等），只在需要时加来源前缀。"
+      },
+      "source_tag_mode": {
+        "type": "enum",
+        "name": "来源标签样式",
+        "options": ["prefix", "compact", "none"],
+        "default": "prefix",
+        "hint": "prefix：完整 [session: …] 等标签。compact：短标签。none：不加来源前缀（更容易串台）。"
+      },
+      "cross_session_time_order": {
+        "type": "switch",
+        "name": "按时间交错多会话",
+        "default": true,
+        "hint": "开启：多会话按时间排成一条线。关闭：按会话分段排列（一般不推荐）。"
+      },
+      "session_send_dedup_sec": {
+        "type": "integer",
+        "name": "跨会话请求去重冷却（秒）",
+        "default": 25,
+        "minimum": 0,
+        "maximum": 600,
+        "hint": "合并启用后会接管官方 session_send：将请求路由到目标会话并激活目标 LLM（带着合并上文继续执行），不是远程扔消息。同一源→同一目标成功路由后，在此秒数内重复调用会被拦截。0 表示关闭去重。"
+      }
+
+
+    }
+  },
+  "section_anchor": {
+    "type": "section",
+    "name": "当前会话提示",
+    "collapsed": true,
+    "fields": {
+      "enable_window_anchor": {
+        "type": "switch",
+        "name": "注入当前会话说明",
+        "default": true,
+        "hint": "每次请求前告诉模型「现在在哪个群/私聊」，减少把别的会话内容当成当前会话。"
+      },
+      "window_anchor_prompt": {
+        "type": "markdown",
+        "name": "会话说明文案",
+        "default": "## 当前会话约束（Session Merger）\n- 当前会话 ID：`{sid}`\n- 当前类型：`{session_type_label}`（{session_type}）\n- 当前标题：`{title}`\n- 当前适配器：`{adapter}`\n- 你是同一个人，可以记得其他会话的经历。\n- 但本轮回复只发生在当前会话；禁止把其他会话的历史消息当成当前会话刚刚发送的内容。\n- 若需要提及其他会话，请明确说来源（例如“刚才在群xxx”）。\n- 带 `[msg_type: peek]` 的消息：是你偶然看到的其他会话的内容，不是当前会话发言，也不是你正式参与过的对话，仅作背景感知。",
+        "hint": "可自由修改。可用占位符：{sid} {session_type} {session_type_label} {title} {adapter} {platform} {self_id}。"
+      }
+    }
+  },
+  "section_history_tool": {
+    "type": "section",
+    "name": "历史查询工具",
+    "collapsed": true,
+    "fields": {
+      "enable_history_tool": {
+        "type": "switch",
+        "name": "启用历史查询工具",
+        "default": true,
+        "hint": "让 AI 可通过 OneBot HTTP 拉取群/好友真实聊天记录。需 OneBot 的 HTTP 服务可用。"
+      },
+      "disable_history_plugin": {
+        "type": "switch",
+        "name": "自动关闭 history_plugin",
+        "default": true,
+        "hint": "其功能已被包含，建议开启，避免工具重复。"
+      },
+      "http_host": {
+        "type": "string",
+        "name": "OneBot HTTP 地址",
+        "default": "localhost",
+        "hint": "OneBot/NapCat 等提供的 HTTP 主机名或 IP。"
+      },
+      "http_port": {
+        "type": "integer",
+        "name": "OneBot HTTP 端口",
+        "default": 3000,
+        "minimum": 1,
+        "maximum": 65535,
+        "hint": "与 OneBot 配置中的 HTTP 端口一致。"
+      },
+      "access_token": {
+        "type": "sensitive",
+        "name": "访问令牌",
+        "default": "",
+        "hint": "若 OneBot 设置了 token，在此填写；没有可留空。"
+      },
+      "master_id": {
+        "type": "string",
+        "name": "主人 ID",
+        "default": "",
+        "hint": "主人可查全部历史：包括所有私聊及「限制查看的群」。留空表示不启用这套权限限制。"
+      },
+      "allowed_users": {
+        "type": "list",
+        "name": "额外允许的用户",
+        "default": [],
+        "hint": "除主人外可额外查所有私聊的用户（其他用户默认也可以查非限制的群聊），每行一个 QQ。"
+      },
+      "restricted_groups": {
+        "type": "list",
+        "name": "限制查看的群",
+        "default": [],
+        "hint": "这些群的历史仅主人可查，额外允许用户也不能查。每行一个群号。"
+      },
+
+      "cache_ttl_sec": {
+        "type": "integer",
+        "name": "查询缓存秒数",
+        "default": 30,
+        "minimum": 0,
+        "maximum": 3600,
+        "hint": "同一会话短时间重复查询直接返回缓存，减少刷接口和卡顿。"
+      }
+    }
+  },
+  "section_command": {
+    "type": "section",
+    "name": "命令",
+    "collapsed": true,
+    "fields": {
+      "enable_status_command": {
+        "type": "switch",
+        "name": "启用状态命令",
+        "default": false,
+        "hint": "发送关键词可查看当前合并组、超时、偷看等状态。"
+      },
+      "status_commands": {
+        "type": "list",
+        "name": "状态命令关键词",
+        "default": ["/merge s", "/合并状态"],
+        "hint": "整句匹配任一词即触发，每行一个。"
+      },
+      "enable_preview_command": {
+        "type": "switch",
+        "name": "启用预览命令",
+        "default": false,
+        "hint": "调试用：预览即将合并进模型的历史摘要。"
+      },
+      "preview_commands": {
+        "type": "list",
+        "name": "预览命令关键词",
+        "default": ["/merge p", "/合并预览"],
+        "hint": "整句匹配任一词即触发，每行一个。"
+      },
+      "command_allowed_users": {
+        "type": "list",
+        "name": "命令白名单",
+        "default": [],
+        "hint": "留空=所有人可用。填写后仅列表内用户可执行上述命令。"
+      }
+    }
+  },
+  "section_debug": {
+    "type": "section",
+    "name": "调试",
+    "collapsed": true,
+    "fields": {
+      "enable_debug_log": {
+        "type": "switch",
+        "name": "详细日志",
+        "default": false,
+        "hint": "输出合并、软硬重启等调试信息，平时建议关闭。"
+      },
+      "log_merged_message_preview": {
+        "type": "switch",
+        "name": "打印合并历史预览",
+        "default": false,
+        "hint": "在日志中打印合并后每条消息的前一小段，体积较大。"
+      },
+      "enable_send_debug_log": {
+        "type": "switch",
+        "name": "发送过程日志",
+        "default": false,
+        "hint": "记录消息解析/发送结果，用于排查发不出消息等问题。"
+      }
+    }
+  },
+  "section_compat": {
+    "type": "section",
+    "name": "兼容",
+    "collapsed": true,
+    "fields": {
+      "auto_disable_ads": {
+        "type": "switch",
+        "name": "自动禁用 ADS",
+        "default": false,
+        "hint": "默认关闭，与 ADS 共存：ADS 负责单独会话的重开，选择「硬重开」模式时会自动关闭 ADS，无需再开此项。"
+      }
+    }
+  }
+}
