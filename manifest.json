@@ -6,7 +6,7 @@
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。",
 
 
-  "repo": null,
+  "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
   "core_version": ">=2.6.1",
   "tags": ["memory", "session"],
   "locales": {
