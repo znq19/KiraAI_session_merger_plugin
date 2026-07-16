@@ -372,7 +372,7 @@
       "enable_reboot_all_command": {
         "type": "switch",
         "name": "启用全部重启命令",
-        "default": true,
+        "default": false,
         "hint": "发送关键词后，清除所有参与合并的会话上下文（类似 reboot 插件，但作用于全部合并会话）。"
       },
       "reboot_all_commands": {
