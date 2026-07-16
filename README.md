@@ -39,7 +39,7 @@
 | **交棒不双开** | 路由成功后源会话结束本轮工具循环 |
 | **软重启 / 硬重开** | 上下文太长时可缩短；默认 soft 只砍「本次视图」 |
 | **观察池偷看** | 未点名消息按概率注入，带来源标签 + `[msg_type: peek]` |
-| **[ADS](https://github.com/znq19/KiraAI_auto_delete_session_plugin) 共存** | soft 默认不关 ADS；hard 自动关 ADS 防冲突 |
+| **自动重开插件[ADS](https://github.com/znq19/KiraAI_auto_delete_session_plugin) 共存** | soft 默认不关 ADS；hard 自动关 ADS 防冲突 |
 | **历史查询工具** | 内置 `get_session_history`（OneBot HTTP） |
 | **全部重启命令** | 默认 `/reboota`：清除所有参与合并的会话上下文（可配白名单与文案） |
 
@@ -277,7 +277,7 @@ A：日志可见 `[MERGER] built/applied`、`[MERGER queue] begin/deferred/relea
 
 ## 注意事项
 
-1. 应对框架逻辑改动较大，默认总开关 **enabled = false**，需手动开启。  
+1. 因对框架逻辑改动较大，默认总开关 **enabled = false**，需手动开启。  
 2. 合并越多越费 token 与延迟。  
 3. **hard 具有破坏性**；`/reboota` 会清空所有合并会话记忆，务必配权限。  
 4. 历史工具依赖 OneBot HTTP。  
