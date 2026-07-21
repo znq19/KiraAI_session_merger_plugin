@@ -40,9 +40,49 @@ def _flatten(chunks: List[List[dict]]) -> List[dict]:
     return out
 
 
-def hard_reset_session(session_mgr, sid: str, keep_turns: int, logger=None) -> int:
+def compute_dropped_flat(session_mgr, sid: str, keep_turns: int) -> List[dict]:
+    """
+    只读计算：硬重开将丢弃的消息（keep 轮之前的部分）。
+    供 async 层在真正重开前生成摘要用；不写盘。
+    """
+    if not session_mgr or not sid:
+        return []
+    keep_turns = max(1, int(keep_turns or 1))
+    try:
+        # 只读内存，避免 fetch_memory 的 _ensure_session_data 写盘
+        data = getattr(session_mgr, "chat_memory", None)
+        if not isinstance(data, dict) or sid not in data:
+            return []
+        mem_list = (data.get(sid) or {}).get("memory") or []
+        if not isinstance(mem_list, list):
+            return []
+        flat: List[dict] = []
+        for chunk in mem_list:
+            if not isinstance(chunk, list):
+                continue
+            for m in chunk:
+                if isinstance(m, dict):
+                    flat.append(m)
+                elif hasattr(m, "to_dict"):
+                    flat.append(m.to_dict())
+        chunks = _clean_and_chunk(flat)
+        if not chunks or len(chunks) <= keep_turns:
+            return []
+        return _flatten(chunks[:-keep_turns])
+    except Exception:
+        return []
+
+
+def hard_reset_session(
+    session_mgr,
+    sid: str,
+    keep_turns: int,
+    logger=None,
+    summary_chunk: Optional[list] = None,
+) -> int:
     """
     对单个 sid：读记忆 → 保留最近 keep_turns 轮 → delete → write。
+    summary_chunk 非空时插入写回 chunks 最前（重开前摘要）。
     返回保留的 chunk 数。失败返回 -1。
     """
     if not session_mgr or not sid:
@@ -74,15 +114,19 @@ def hard_reset_session(session_mgr, sid: str, keep_turns: int, logger=None) -> i
         except Exception:
             pass
 
+        to_write: List[List[dict]] = []
         if new_flat:
-            to_write = _clean_and_chunk(new_flat)
-            session_mgr.write_memory(sid, to_write if to_write else [])
-        else:
-            session_mgr.write_memory(sid, [])
+            to_write = _clean_and_chunk(new_flat) or []
+        if summary_chunk:
+            to_write = [list(summary_chunk)] + to_write
+        session_mgr.write_memory(sid, to_write)
 
         if logger:
             logger.warning(
-                "[MERGER hard] reset sid=%s keep_chunks=%d", sid, kept
+                "[MERGER hard] reset sid=%s keep_chunks=%d summary=%s",
+                sid,
+                kept,
+                "yes" if summary_chunk else "no",
             )
         return kept
     except Exception as e:
@@ -96,8 +140,13 @@ def hard_reset_members(
     sids: List[str],
     keep_turns: int,
     logger=None,
+    summary_chunks: Optional[dict] = None,
 ) -> dict:
+    """summary_chunks: sid -> summary_chunk 映射（可选，重开前摘要）。"""
     results = {}
     for sid in sids:
-        results[sid] = hard_reset_session(session_mgr, sid, keep_turns, logger)
+        sc = (summary_chunks or {}).get(sid)
+        results[sid] = hard_reset_session(
+            session_mgr, sid, keep_turns, logger, summary_chunk=sc
+        )
     return results

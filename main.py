@@ -82,6 +82,14 @@ class SessionMergerPlugin(BasePlugin):
         self.enable_window_anchor = True
         self.window_anchor_prompt = DEFAULT_WINDOW_ANCHOR_PROMPT
 
+        # 硬重开前摘要
+        self.summarize_mode = "off"
+        self.summarize_model = ""
+        self.summarize_timeout_sec = 5.0
+        self.summarize_max_input_chars = 6000
+        self.summarize_max_output_chars = 3000
+        self.summarize_prompt_template = ""
+
         # history tool
         self.enable_history_tool = True
         self.disable_history_plugin = True
@@ -112,6 +120,20 @@ class SessionMergerPlugin(BasePlugin):
             "❌ 权限不足：您没有全部重启合并会话的权限"
         )
         self.reboot_all_error_message = "❌ 全部重启失败: {error}"
+
+        # 压缩重开命令（对齐 reboot_all：list 关键词 + 白名单 + 整句匹配）
+        self.enable_reset_summary_command = False
+        self.reset_summary_commands: List[str] = ["/resum"]
+        self.reset_summary_enable_permission = False
+        self.reset_summary_allowed_users: List[str] = []
+        self.reset_summary_success_message = (
+            "✅ 已压缩重开当前合并组的会话记忆（共 {count} 个，保留最近 {keep} 轮{summary}），"
+            "我们可以重新开始了！"
+        )
+        self.reset_summary_permission_denied_message = (
+            "❌ 权限不足：您没有压缩重开合并会话的权限"
+        )
+        self.reset_summary_error_message = "❌ 压缩重开失败: {error}"
 
         # 合并组单一 agent 队列（逻辑一个窗口）
         self.enable_group_agent_queue = True
@@ -241,6 +263,30 @@ class SessionMergerPlugin(BasePlugin):
             or DEFAULT_WINDOW_ANCHOR_PROMPT
         )
 
+        summ = cfg.get("section_summarize", {})
+        if not isinstance(summ, dict):
+            summ = {}
+        self.summarize_mode = str(summ.get("summarize_mode", "off") or "off").lower()
+        if self.summarize_mode not in ("off", "sync", "async"):
+            self.summarize_mode = "off"
+        self.summarize_model = str(summ.get("summarize_model", "") or "")
+        self.summarize_timeout_sec = float(summ.get("summarize_timeout_sec", 30.0) or 30.0)
+        # 注意：0 是合法值（表示无上限），不能用 `or 默认值` 读取
+        _mic = summ.get("summarize_max_input_chars", 6000)
+        self.summarize_max_input_chars = int(_mic if _mic is not None else 6000)
+        _moc = summ.get("summarize_max_output_chars", 3000)
+        self.summarize_max_output_chars = int(_moc if _moc is not None else 3000)
+        self.summarize_prompt_template = str(
+            summ.get("summarize_prompt_template", "") or ""
+        )
+        # 摘要详细日志：主配置在 section_summarize；兼容旧版写在 section_debug 的同名开关
+        _summ_log = summ.get("enable_summary_logging", None)
+        if _summ_log is None:
+            _summ_log = (cfg.get("section_debug", {}) or {}).get(
+                "enable_summary_logging", False
+            )
+        self.enable_summary_logging = bool(_summ_log)
+
         hist = cfg.get("section_history_tool", {})
         http_legacy = cfg.get("section_http", {})
         perm_legacy = cfg.get("section_history_permission", {})
@@ -311,6 +357,57 @@ class SessionMergerPlugin(BasePlugin):
         self.reboot_all_error_message = str(
             cmd.get("reboot_all_error_message", "❌ 全部重启失败: {error}")
             or "❌ 全部重启失败: {error}"
+        )
+
+        # 压缩重开命令（对齐 reboot_all）
+        self.enable_reset_summary_command = bool(
+            cmd.get("enable_reset_summary_command", False)
+        )
+        rsc = cmd.get(
+            "reset_summary_commands",
+            cmd.get("reset_summary_command", ["/resum"]),
+        )
+        if isinstance(rsc, str):
+            rsc = [rsc]
+        self.reset_summary_commands = [
+            str(x).strip() for x in (rsc or []) if str(x).strip()
+        ]
+        # 兼容旧版 trigger_keywords（逗号分隔字符串）：并入命令列表
+        legacy_kw = str(summ.get("trigger_keywords", "") or "").strip()
+        if legacy_kw:
+            for kw in legacy_kw.split(","):
+                kw = kw.strip()
+                if kw and kw not in self.reset_summary_commands:
+                    self.reset_summary_commands.append(kw)
+        if not self.reset_summary_commands:
+            self.reset_summary_commands = ["/resum"]
+        self.reset_summary_enable_permission = bool(
+            cmd.get("reset_summary_enable_permission", False)
+        )
+        rsau = cmd.get("reset_summary_allowed_users", [])
+        if isinstance(rsau, str):
+            rsau = [x.strip() for x in rsau.split(",") if x.strip()]
+        self.reset_summary_allowed_users = [
+            str(u).strip() for u in (rsau or []) if str(u).strip()
+        ]
+        self.reset_summary_success_message = str(
+            cmd.get(
+                "reset_summary_success_message",
+                "✅ 已压缩重开当前合并组的会话记忆（共 {count} 个，保留最近 {keep} 轮{summary}），"
+                "我们可以重新开始了！",
+            )
+            or "✅ 已压缩重开当前合并组的会话记忆（共 {count} 个，保留最近 {keep} 轮{summary}），我们可以重新开始了！"
+        )
+        self.reset_summary_permission_denied_message = str(
+            cmd.get(
+                "reset_summary_permission_denied_message",
+                "❌ 权限不足：您没有压缩重开合并会话的权限",
+            )
+            or "❌ 权限不足：您没有压缩重开合并会话的权限"
+        )
+        self.reset_summary_error_message = str(
+            cmd.get("reset_summary_error_message", "❌ 压缩重开失败: {error}")
+            or "❌ 压缩重开失败: {error}"
         )
 
         # 组级 agent 队列（独立分组；兼容旧配置写在 section_context 的情况）
@@ -393,6 +490,14 @@ class SessionMergerPlugin(BasePlugin):
             enable_window_anchor=self.enable_window_anchor,
             window_anchor_prompt=self.window_anchor_prompt,
             merge_build_timeout_sec=self.merge_build_timeout_sec,
+            ctx=self.ctx,
+            summarize_mode=self.summarize_mode,
+            summarize_model=self.summarize_model,
+            summarize_timeout_sec=self.summarize_timeout_sec,
+            summarize_max_input_chars=self.summarize_max_input_chars,
+            summarize_max_output_chars=self.summarize_max_output_chars,
+            summarize_prompt_template=self.summarize_prompt_template,
+            enable_summary_logging=self.enable_summary_logging,
             debug=self.enable_debug_log,
             log_preview=self.log_merged_message_preview,
             logger=logger,
@@ -429,7 +534,7 @@ class SessionMergerPlugin(BasePlugin):
 
         logger.info(
             "会话合并初始化 enabled=%s mode=%s max_sessions=%d chunks=%d "
-            "token_limit=%d keep=%d timeout=%dm peek=%.3f group_queue=%s",
+            "token_limit=%d keep=%d timeout=%dm peek=%.3f group_queue=%s summarize=%s",
             self.enabled,
             self.merge_reset_mode,
             self.max_merge_sessions,
@@ -439,6 +544,7 @@ class SessionMergerPlugin(BasePlugin):
             self.other_session_timeout,
             self.unmentioned_probability,
             self.enable_group_agent_queue,
+            self.summarize_mode,
         )
 
     @on.loaded()
@@ -635,6 +741,11 @@ class SessionMergerPlugin(BasePlugin):
             except Exception:
                 pass
         self._unwrap_update_memory()
+        if self.engine:
+            try:
+                self.engine.cancel_summary_tasks()
+            except Exception:
+                pass
         if self.group_queue:
             try:
                 self.group_queue.clear_all()
@@ -881,6 +992,14 @@ class SessionMergerPlugin(BasePlugin):
             return True
         return self._get_event_user_id(event) in self.reboot_all_allowed_users
 
+    def _reset_summary_user_allowed(self, event: KiraMessageEvent) -> bool:
+        """手动重开命令白名单：未开权限 / 白名单为空 → 放行。"""
+        if not self.reset_summary_enable_permission:
+            return True
+        if not self.reset_summary_allowed_users:
+            return True
+        return self._get_event_user_id(event) in self.reset_summary_allowed_users
+
     def _match_command(self, text: str, commands: List[str]) -> bool:
         if not text or not commands:
             return False
@@ -1075,6 +1194,69 @@ class SessionMergerPlugin(BasePlugin):
             event.discard(force=True)
             event.stop()
             return
+
+        if self.enable_reset_summary_command and self._match_command(
+            text, self.reset_summary_commands
+        ):
+            await self._handle_reset_summary(event, sid)
+            event.discard(force=True)
+            event.stop()
+            return
+
+    async def _handle_reset_summary(self, event: KiraMessageEvent, sid: str):
+        """压缩重开：立即压缩重开当前合并组（对齐 reboot_all 的命令形态）。"""
+        user_id = self._get_event_user_id(event)
+        user_name = self._get_event_user_name(event)
+
+        if self.enable_debug_log:
+            logger.info(
+                "[MERGER] reset_summary cmd | user=%s(%s) | from=%s",
+                user_name,
+                user_id,
+                sid,
+            )
+
+        if not self._reset_summary_user_allowed(event):
+            if self.enable_debug_log:
+                logger.info("[MERGER] reset_summary denied user=%s", user_id)
+            await self._reply(sid, self.reset_summary_permission_denied_message)
+            return
+
+        if not self.engine or getattr(self.ctx, "session_mgr", None) is None:
+            await self._reply(
+                sid,
+                self.reset_summary_error_message.format(error="合并引擎未初始化"),
+            )
+            return
+
+        try:
+            stats = await self.engine.manual_reset_with_summary(sid)
+            if self.summarize_mode == "off":
+                summary_part = ""
+            elif stats.get("summarized"):
+                summary_part = f"，其中 {stats['summarized']} 个已注入前情摘要"
+            else:
+                summary_part = "（无更早历史可摘要或摘要生成失败）"
+            msg = self.reset_summary_success_message.format(
+                count=stats.get("ok", 0),
+                keep=stats.get("keep", self.merge_keep_turns),
+                summary=summary_part,
+            )
+            if stats.get("fail"):
+                msg = f"{msg}\n（失败 {stats['fail']} 个）"
+            await self._reply(sid, msg)
+            logger.warning(
+                "[MERGER] reset_summary done by %s(%s): %s",
+                user_name,
+                user_id,
+                stats,
+            )
+        except Exception as e:
+            logger.error("[MERGER] reset_summary failed: %s", e)
+            await self._reply(
+                sid,
+                self.reset_summary_error_message.format(error=str(e)),
+            )
 
     async def _handle_reboot_all(self, event: KiraMessageEvent, sid: str):
         """清除所有参与合并的会话上下文（参考 reboot_plugin）。"""
