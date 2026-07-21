@@ -268,6 +268,61 @@
       }
     }
   },
+  "section_summarize": {
+    "type": "section",
+    "name": "硬重开前自动摘要",
+    "collapsed": true,
+    "fields": {
+      "summarize_mode": {
+        "type": "string",
+        "name": "摘要模式",
+        "default": "sync",
+        "options": ["off", "sync", "async"],
+        "hint": "仅超限模式为 hard 时生效。off=不摘要（原行为）；sync=硬重开前同步为每个成员会话生成摘要并写入其记忆首部（阻塞本轮几秒，精度最高）；async=先重开不阻塞，摘要后台生成好后补写（重开后第一轮回复看不到摘要）。"
+      },
+      "summarize_model": {
+        "type": "model_select",
+        "name": "摘要模型",
+        "model_type": "llm",
+        "default": "",
+        "hint": "用于生成硬重开前摘要的模型。不选则自动回退：快速模型 → 默认模型。建议选便宜快速的小模型。"
+      },
+      "summarize_timeout_sec": {
+        "type": "float",
+        "name": "摘要超时（秒）",
+        "default": 30.0,
+        "minimum": 0.5,
+        "maximum": 300.0,
+        "hint": "单个会话摘要的最长等待；sync 模式下多会话并发生成，总耗时约等于单次超时。超时则该会话放弃摘要直接重开。"
+      },
+      "summarize_max_input_chars": {
+        "type": "integer",
+        "name": "摘要输入上限（字符）",
+        "default": 6000,
+        "minimum": -1,
+        "hint": "每个会话喂给摘要模型的被删历史最大字符数（从最新往前截取）。填 0 或 -1 表示无上限（前文完整压缩，token 消耗和耗时会随历史长度增长）。"
+      },
+      "summarize_max_output_chars": {
+        "type": "integer",
+        "name": "摘要输出上限（字符）",
+        "default": 3000,
+        "minimum": -1,
+        "hint": "每个会话生成摘要的最大字符数，超出则截断（防止摘要本身撑大重开后的记忆）。填 0 或 -1 表示无上限。"
+      },
+      "summarize_prompt_template": {
+        "type": "markdown",
+        "name": "摘要提示词",
+        "default": "你是聊天记忆压缩器。下面这段较早的聊天记录即将被清理，请把它压缩成一段简短摘要（200字内），用于衔接后续对话，让你能像没有失忆一样自然地继续聊下去。\n请优先保留：\n- 正在进行或未完成的事情（话题、任务、约定、待办）\n- 重要事实（人物、关系、时间、地点、已做的决定）\n- 对方的偏好、称呼、语气和你们之间的相处方式\n时间一律写绝对日期，直接输出摘要正文，不要任何开场白、标题或解释。",
+        "hint": "可基于默认文案自由修改（如调整字数上限、补充人设相关要求）。留空则使用内置默认提示词。"
+      },
+      "enable_summary_logging": {
+        "name": "摘要详细日志",
+        "type": "switch",
+        "default": false,
+        "hint": "开启后在日志中输出摘要触发条件、复用判断、生成的完整摘要文本等详细信息（方便排查，但会增加日志量）"
+      }
+    }
+  },
   "section_history_tool": {
     "type": "section",
     "name": "历史查询工具",
@@ -409,6 +464,48 @@
         "type": "string",
         "name": "全部重启错误反馈",
         "default": "❌ 全部重启失败: {error}",
+        "hint": "发生错误时返回。可用 {error} 显示错误信息。"
+      },
+      "enable_reset_summary_command": {
+        "type": "switch",
+        "name": "启用压缩重开命令",
+        "default": false,
+        "hint": "发送命令关键词后，立即对当前会话所在合并组执行「压缩重开」：先为被清理的较早历史生成摘要，再硬重开并保留「超限保留轮数」（摘要受「摘要模式」控制，off = 只重开不摘要）。与超限处理模式无关，soft 模式下也可手动触发。不同于 reboot 类插件的全清空，压缩重开会保留摘要与最近对话。默认关闭。"
+      },
+      "reset_summary_commands": {
+        "type": "list",
+        "name": "压缩重开命令关键词",
+        "default": ["/resum"],
+        "hint": "整句匹配任一词即触发，每行一个。默认 /resum。"
+      },
+      "reset_summary_enable_permission": {
+        "type": "switch",
+        "name": "压缩重开启用权限控制",
+        "default": false,
+        "hint": "开启后仅「压缩重开白名单」内用户可执行；关闭则不限制（仍受合并插件启用状态约束）。"
+      },
+      "reset_summary_allowed_users": {
+        "type": "list",
+        "name": "压缩重开白名单",
+        "default": [],
+        "hint": "允许执行压缩重开的用户 ID，每行一个。权限开启且本列表为空时，视为不限制用户。"
+      },
+      "reset_summary_success_message": {
+        "type": "string",
+        "name": "压缩重开成功反馈",
+        "default": "✅ 已压缩重开当前合并组的会话记忆（共 {count} 个，保留最近 {keep} 轮{summary}），我们可以继续对话了！",
+        "hint": "成功时返回。可用占位符：{count} 重开的会话数，{keep} 保留轮数，{summary} 摘要状态说明。"
+      },
+      "reset_summary_permission_denied_message": {
+        "type": "string",
+        "name": "压缩重开权限不足反馈",
+        "default": "❌ 权限不足：您没有压缩重开合并会话的权限",
+        "hint": "权限不足时返回的消息。"
+      },
+      "reset_summary_error_message": {
+        "type": "string",
+        "name": "压缩重开错误反馈",
+        "default": "❌ 压缩重开失败: {error}",
         "hint": "发生错误时返回。可用 {error} 显示错误信息。"
       }
     }

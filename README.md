@@ -2,10 +2,11 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.1.0** · 适用于 [KiraAI](https://github.com/) `core >= 2.6.1`
+**版本 2.3.2** · 适用于 [KiraAI](https://github.com/) `core >= 2.6.1`
 
 > 让 AI 在不同群聊、私聊里**真的是同一个人**——记得跨会话的经历，又能分清「现在在跟谁聊」。  
-> 2.1 起：合并组内**逻辑一个窗口**（单一 Agent 队列），时间线按轮原子拼装，更接近官方单会话串行体验。
+> 2.1 起：合并组内**逻辑一个窗口**（单一 Agent 队列），时间线按轮原子拼装，更接近官方单会话串行体验。  
+> 2.3 起：hard 模式**重开前自动摘要**（sync/async），被清理的旧历史压缩成记忆首条，无缝衔接上文。
 
 ---
 
@@ -37,11 +38,13 @@
 | **assistant 不加会话前缀** | 对齐官方落盘习惯，减少模型学样输出 `[session:]` 污染 |
 | **跨会话路由** | 「去私聊 / 去群里」→ 切到目标会话继续执行 |
 | **交棒不双开** | 路由成功后源会话结束本轮工具循环 |
-| **软重启 / 硬重开** | 上下文太长时可缩短；默认 soft 只砍「本次视图」 |
+| **软重启 / 硬重开** | 上下文太长时可缩短；默认 soft 只砍「本次视图」|
+| **硬重开前自动摘要** | hard 删除旧历史前用 LLM 生成摘要，注入记忆首条，重开后不丢上文（sync / async） |
 | **观察池偷看** | 未点名消息按概率注入，带来源标签 + `[msg_type: peek]` |
 | **自动重开插件[ADS](https://github.com/znq19/KiraAI_auto_delete_session_plugin) 共存** | soft 默认不关 ADS；hard 自动关 ADS 防冲突（因为等于加强版的ADS Plus） |
 | **历史查询工具** | 内置 `get_session_history`（OneBot HTTP） |
 | **全部重启命令** | 默认 `/reboota`：清除所有参与合并的会话上下文（可配白名单与文案） |
+| **压缩重开命令** | 默认 `/resum`（默认关闭）：对当前合并组立即执行「摘要 + 硬重开」（可配白名单与文案） |
 
 ---
 
@@ -157,6 +160,20 @@ pip install -r requirements.txt
 
 > **提示：**如果不想手动管理，请选择**hard**模式。
 
+### 硬重开前自动摘要（2.3）
+
+hard 模式触发超限重开时，可先调用 LLM 把将被清理的较早历史压缩成一段摘要，写入各会话记忆首条（`[前情摘要|系统注入]` 标记），重开后 bot 仍能衔接上文。仅 hard 模式生效。
+
+三种模式：
+
+| 模式 | 行为 |
+|------|------|
+| **off** | 不摘要（原行为） |
+| **sync** | 重开前同步生成摘要并写入记忆（阻塞本轮几秒，精度最高） |
+| **async** | 先重开不阻塞，摘要后台生成后补写（重开后第一轮看不到摘要） |
+
+可选独立摘要模型（不选自动回退：快速模型 → 默认模型）、超时、输入/输出上限与自定义提示词。连续降级窗口内自动复用上次已有摘要，避免重复调 LLM。
+
 ### 观察池 / 偷看
 
 未 @ 消息进观察池；按概率注入。来源标签与合并时间线一致，并带 peek 标记。
@@ -181,6 +198,12 @@ pip install -r requirements.txt
 - 工具轨迹、来源标签、跨会话时间交错  
 - **合并构建超时（秒）**
 
+### 硬重开前自动摘要（2.3）
+
+- 摘要模式（off / sync / async）  
+- 摘要模型、超时、输入/输出上限  
+- 自定义摘要提示词、摘要详细日志  
+
 ### 合并组 Agent 队列（2.1）
 
 - 合并组单一 Agent 队列（默认开）  
@@ -200,7 +223,8 @@ pip install -r requirements.txt
 
 - 状态 / 预览命令（默认均关闭）  
 - **全部重启** `/reboota`：开关、关键词、权限、成功/拒绝/错误文案  
-- 命令白名单（状态/预览）；全部重启有独立白名单  
+- **压缩重开** `/resum`：开关、关键词、权限、成功/拒绝/错误文案  
+- 命令白名单（状态/预览）；全部重启 / 压缩重开各有独立白名单  
 
 ### 调试 / 兼容
 
@@ -216,6 +240,7 @@ pip install -r requirements.txt
 | `/merge s` / `/合并状态` | 合并组、超时、偷看等 | **关** |
 | `/merge p` / `/合并预览` | 预览合并历史 | **关** |
 | `/reboota` | 清除**全部**参与合并的会话上下文 | **关**（建议配白名单） |
+| `/resum` | 压缩重开当前合并组：先为被清理的较早历史生成摘要，再硬重开并保留「超限保留轮数」；与超限模式无关，soft 下也可手动触发；摘要受「摘要模式」控制（off = 只重开不摘要）。不同于 reboot 的全清空，会保留摘要与最近对话 | **关**（建议配白名单） |
 
 ---
 
@@ -234,18 +259,19 @@ pip install -r requirements.txt
 
 ```text
 kira_session_merger/
-├── manifest.json              # 元数据 version 2.1.0
+├── manifest.json              # 元数据 version 2.3.2
 ├── schema.json                # WebUI 配置
 ├── main.py                    # 钩子、配置、ROUTE、交棒、组队列
-├── merge_engine.py            # 读时合并 + 软/硬重启
+├── merge_engine.py            # 读时合并 + 软/硬重启 + 摘要集成
 ├── timeline.py                # 多会话时间线（按轮原子）
 ├── group_agent_queue.py       # 合并组单一 Agent 队列
 ├── memory_access.py           # 只读官方记忆
 ├── group_resolver.py          # 合并范围
 ├── cross_session.py           # 跨会话 ROUTE
 ├── observe_pool.py            # 观察池 / 偷看
-├── reset_policy.py            # 软重启策略
-├── hard_reset.py              # 硬重开
+├── reset_policy.py            # 软重启策略（含动态 keep 减半）
+├── hard_reset.py              # 硬重开（含摘要 chunk 写入）
+├── summarizer.py              # 硬重开前摘要（LLM 压缩）
 ├── history_tool.py            # get_session_history
 ├── anchor.py                  # 当前会话提示
 ├── compat.py                  # ADS / history 兼容
@@ -288,6 +314,20 @@ A：日志可见 `[MERGER] built/applied`、`[MERGER queue] begin/deferred/relea
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.3.2
+
+- **硬重开前自动摘要**：hard 超限重开前，用 LLM 生成被删历史摘要并写入各成员会话记忆首条（`[前情摘要|系统注入]`），重开后 bot 仍能衔接上文  
+- **sync / async 两种模式**：sync 阻塞生成后写入（精度最高）；async 先重开、后台补写（不阻塞）  
+- **连续降级摘要复用**：窗口内连续超限时自动读取上次已写入的摘要，避免重复调 LLM  
+- **只读预检机制**：`precheck_hard_reset()` 在真正重开前只读预判本轮是否需要 hard，避免摘要数据被重开先污染  
+- **压缩重开命令 `/resum`** 集成摘要：命令触发的硬重开同样受摘要模式控制  
+- **配置分组**：新增「硬重开前自动摘要」配置区（摘要模式、模型、超时、输入/输出上限、自定义提示词、详细日志开关）  
+- **摘要详细日志**：`enable_summary_logging` 开关，输出触发条件、复用判断、完整摘要文本等调试信息  
+- `summarizer.py` 模块：与 ADS 插件的摘要模块保持同构（独立副本，避免跨插件依赖）  
+- `reset_policy.py` 新增 `peek_should_check` / `peek_reset_keep` 只读方法，供摘要预检使用，不污染组级重开状态  
+- `hard_reset.py`：`hard_reset_session` / `hard_reset_members` 支持 `summary_chunk` 参数；新增 `compute_dropped_flat` 只读计算待丢弃消息（供 async 模式提前捕获）  
+- `merge_engine.py` 重构：摘要生成走独立 `_summarize_members` + `_schedule_async_summaries` + `cancel_summary_tasks`
+
 ### 2.1.0
 
 - **合并组单一 Agent 队列**：同组合并组串行执行；busy 入队，等 `update_memory` 落盘后再调度；可配锁超时 / settle / 队列长度  
@@ -315,7 +355,7 @@ A：日志可见 `[MERGER] built/applied`、`[MERGER queue] begin/deferred/relea
 
 - **plugin_id:** `kira_session_merger`  
 - **display_name:** 会话合并  
-- **version:** 2.1.0  
+- **version:** 2.3.2  
 - **author:** znq19  
 
 欢迎 Issue / PR 反馈合并策略与跨会话体验。

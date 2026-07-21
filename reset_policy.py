@@ -83,6 +83,23 @@ class SoftResetState:
         self._last_check[group_id] = now
         return True
 
+    def peek_should_check(self, group_id: str, now: Optional[float] = None) -> bool:
+        """只读版 should_check：不更新 _last_check（供重开前摘要预检用）。"""
+        if self.check_interval <= 0:
+            return True
+        now = now if now is not None else time.time()
+        return (now - self._last_check.get(group_id, 0)) >= self.check_interval
+
+    def peek_reset_keep(self, group_id: str, now: Optional[float] = None) -> int:
+        """只读版 on_reset：返回「若此刻重开会用的 keep」，不改任何状态。"""
+        now = now if now is not None else time.time()
+        last_reset = self._last_reset.get(group_id, 0)
+        half_window = self.check_interval / 2 if self.check_interval > 0 else 30.0
+        if last_reset and (now - last_reset) < half_window:
+            old = self._dynamic_keep.get(group_id, self.default_keep)
+            return max(1, old // 2)
+        return self.default_keep
+
     def current_keep(self, group_id: str) -> int:
         """当前动态保留轮数（未重开过则用配置默认）。"""
         return max(1, int(self._dynamic_keep.get(group_id, self.default_keep)))

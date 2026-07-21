@@ -1,7 +1,7 @@
 {
   "plugin_id": "kira_session_merger",
   "display_name": "会话合并",
-  "version": "2.1.0",
+  "version": "2.3.2",
   "author": "znq19",
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。",
 

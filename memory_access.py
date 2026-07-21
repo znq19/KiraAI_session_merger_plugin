@@ -42,6 +42,36 @@ def safe_session_meta(session_mgr, sid: str) -> Dict[str, Any]:
     }
 
 
+def safe_read_memory(
+    session_mgr,
+    sid: str,
+) -> List[List[dict]]:
+    """按 chunk 结构只读记忆（不触发 _ensure_session_data 写盘），无会话返回 []。"""
+    if not session_mgr or not sid:
+        return []
+    data = getattr(session_mgr, "chat_memory", None)
+    if not isinstance(data, dict) or sid not in data:
+        return []
+    mem_list = (data.get(sid) or {}).get("memory") or []
+    if not isinstance(mem_list, list):
+        return []
+    chunks: List[List[dict]] = []
+    for chunk in mem_list:
+        if not isinstance(chunk, list):
+            continue
+        norm: List[dict] = []
+        for m in chunk:
+            if isinstance(m, dict):
+                norm.append(m)
+            elif hasattr(m, "to_dict"):
+                try:
+                    norm.append(m.to_dict())
+                except Exception:
+                    pass
+        chunks.append(norm)
+    return chunks
+
+
 def safe_fetch_memory(
     session_mgr,
     sid: str,
