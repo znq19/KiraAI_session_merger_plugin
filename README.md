@@ -1,4 +1,4 @@
-# 会话合并 · kira_session_merger
+# 会话合并与互通（KSM） · kira_session_merger
 
 **版本 2.5.0** · 适用于 KiraAI `core >= 2.6.1`
 
