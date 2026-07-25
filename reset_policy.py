@@ -104,18 +104,26 @@ class SoftResetState:
         """当前动态保留轮数（未重开过则用配置默认）。"""
         return max(1, int(self._dynamic_keep.get(group_id, self.default_keep)))
 
-    def on_reset(self, group_id: str, now: Optional[float] = None) -> int:
+    def on_reset(
+        self,
+        group_id: str,
+        now: Optional[float] = None,
+        degrade: Optional[bool] = None,
+    ) -> int:
         """
         仅在「确认超限且即将执行软/硬重开」时调用。
-        - 若距上次重开很近（连续超限）→ keep 减半（最少 1）
-        - 否则 → 重置为配置的 default_keep
+        - degrade=True（上次重开后仍超预算）→ keep 减半（最少 1）
+        - degrade=False → 重置为配置的 default_keep
+        - degrade=None → 旧行为：距上次重开很近（连续超限）才减半
         返回本次应使用的 keep 轮数。
         """
         now = now if now is not None else time.time()
-        last_reset = self._last_reset.get(group_id, 0)
-        half_window = self.check_interval / 2 if self.check_interval > 0 else 30.0
+        if degrade is None:
+            last_reset = self._last_reset.get(group_id, 0)
+            half_window = self.check_interval / 2 if self.check_interval > 0 else 30.0
+            degrade = bool(last_reset and (now - last_reset) < half_window)
 
-        if last_reset and (now - last_reset) < half_window:
+        if degrade:
             old = self._dynamic_keep.get(group_id, self.default_keep)
             new = max(1, old // 2)
             self._dynamic_keep[group_id] = new

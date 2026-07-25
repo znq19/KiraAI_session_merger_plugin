@@ -14,6 +14,7 @@ from core.chat.message_elements import Text
 
 from .anchor import DEFAULT_WINDOW_ANCHOR_PROMPT
 from .compat import (
+    handle_ccs_conflict,
     log_compat_status,
     maybe_disable_ads,
     maybe_disable_history_plugin,
@@ -76,6 +77,34 @@ class SessionMergerPlugin(BasePlugin):
         self.source_tag_mode = "prefix"
         self.cross_session_time_order = True
         self.merge_build_timeout_sec = 5.0
+        # v2：写穿式硬重开 + 合并排序模式 + 累积摘要 + CCS 互斥
+        self.hard_write_through = True
+        self.merge_order_mode = "session_blocks"
+        self.cumulative_summary = True
+        self.merge_prompt_template = ""
+        self.self_compress_prompt_template = ""
+        self.ccs_conflict_policy = "disable_ccs"
+        self.summary_store = None
+        # 双触发 + 摘要输入预处理
+        self.merge_trigger_mode = "tokens"
+        self.merge_trigger_rounds = 0
+        self.preprocess_tool_results = True
+        self.tool_result_max_chars = 2000
+        self.preprocess_in_sync = False
+        self.merge_timeout_sec = 120.0
+        self.preheat_ratio = 0.7
+        self.sync_wait_timeout = 0.0
+        # 持续压缩合并策略（v3：支持 immediate / append_then_merge / append_only）
+        self.continuous_merge_strategy = "append_then_merge"
+        self.background_merge_max_concurrent = 5
+        self.background_merge_timeout_sec = 120.0
+        self.replace_concat_after_merge = True
+        self.background_merge_retry_interval_sec = 30.0
+        self.background_merge_max_retries = 3
+        self.max_concat_summary_chars = 5000
+        self.concat_overflow_strategy = "self_compress"
+        # 缓存修复：time 段挪到请求队尾
+        self.move_time_to_tail = True
 
 
         # anchor
@@ -85,9 +114,9 @@ class SessionMergerPlugin(BasePlugin):
         # 硬重开前摘要
         self.summarize_mode = "off"
         self.summarize_model = ""
-        self.summarize_timeout_sec = 5.0
-        self.summarize_max_input_chars = 6000
-        self.summarize_max_output_chars = 3000
+        self.summarize_timeout_sec = 60.0
+        self.summarize_max_input_chars = 10000
+        self.summarize_max_output_chars = 5000
         self.summarize_prompt_template = ""
 
         # history tool
@@ -193,47 +222,77 @@ class SessionMergerPlugin(BasePlugin):
         self.exclude_sessions = [str(s).strip() for s in (exclude or []) if str(s).strip()]
 
         ctx_sec = cfg.get("section_context", {})
+        act_sec = cfg.get("section_session_activity", {})
+        disp_sec = cfg.get("section_merge_display", {})
+        trig_sec = cfg.get("section_reset_trigger", {})
+        # 兼容旧版：这些字段原先都在 section_context，现在拆分到新分组。
+        # 新分组优先：reset_trigger > merge_display > session_activity > context，
+        # 这样旧 section_context 里的残留值不会覆盖用户在新分组里设置的值。
+        merged_ctx: dict = {}
+        for sec in (trig_sec, disp_sec, act_sec, ctx_sec):
+            if isinstance(sec, dict):
+                for k, v in sec.items():
+                    merged_ctx.setdefault(k, v)
+
         self.max_merged_chunks = int(
-            ctx_sec.get(
+            merged_ctx.get(
                 "max_merged_chunks",
-                ctx_sec.get("max_pool_turns", 10),
+                merged_ctx.get("max_pool_turns", 10),
             )
             or 10
         )
         # 兼容旧 key max_merged_tokens
         self.merge_token_limit = int(
-            ctx_sec.get(
+            merged_ctx.get(
                 "merge_token_limit",
-                ctx_sec.get("max_merged_tokens", ctx_sec.get("max_pool_tokens", 30000)),
+                merged_ctx.get("max_merged_tokens", merged_ctx.get("max_pool_tokens", 30000)),
             )
             or 30000
         )
-        self.merge_keep_turns = int(ctx_sec.get("merge_keep_turns", 6) or 6)
-        self.merge_reset_mode = str(ctx_sec.get("merge_reset_mode", "soft") or "soft").lower()
+        self.merge_keep_turns = int(merged_ctx.get("merge_keep_turns", 6) or 6)
+        self.merge_reset_mode = str(merged_ctx.get("merge_reset_mode", "soft") or "soft").lower()
         if self.merge_reset_mode not in ("soft", "hard"):
             self.merge_reset_mode = "soft"
-        self.merge_check_interval_sec = int(ctx_sec.get("merge_check_interval_sec", 60) or 0)
-        self.chars_per_token = float(ctx_sec.get("chars_per_token", 2.0))
-        self.other_session_timeout = int(ctx_sec.get("other_session_timeout", 20) or 0)
+        self.merge_check_interval_sec = int(merged_ctx.get("merge_check_interval_sec", 60) or 0)
+        self.chars_per_token = float(merged_ctx.get("chars_per_token", 2.0))
+        self.other_session_timeout = int(merged_ctx.get("other_session_timeout", 20) or 0)
         self.other_session_timeout_private = int(
-            ctx_sec.get("other_session_timeout_private", 0) or 0
+            merged_ctx.get("other_session_timeout_private", 0) or 0
         )
         self.other_session_timeout_group = int(
-            ctx_sec.get("other_session_timeout_group", 0) or 0
+            merged_ctx.get("other_session_timeout_group", 0) or 0
         )
         self.unmentioned_probability = float(
-            ctx_sec.get("unmentioned_probability", 0.01) or 0
+            merged_ctx.get("unmentioned_probability", 0.01) or 0
         )
         self.max_observe_per_session = int(
-            ctx_sec.get("max_observe_per_session", 20) or 20
+            merged_ctx.get("max_observe_per_session", 20) or 20
         )
-        self.peek_max_messages = int(ctx_sec.get("peek_max_messages", 3) or 3)
-        self.include_tool_traces = bool(ctx_sec.get("include_tool_traces", True))
-        self.drop_unpaired_tools = bool(ctx_sec.get("drop_unpaired_tools", True))
-        self.source_tag_mode = str(ctx_sec.get("source_tag_mode", "prefix") or "prefix")
-        self.cross_session_time_order = bool(ctx_sec.get("cross_session_time_order", True))
+        self.peek_max_messages = int(merged_ctx.get("peek_max_messages", 3) or 3)
+        self.include_tool_traces = bool(merged_ctx.get("include_tool_traces", True))
+        self.drop_unpaired_tools = bool(merged_ctx.get("drop_unpaired_tools", True))
+        self.source_tag_mode = str(merged_ctx.get("source_tag_mode", "prefix") or "prefix")
+        # merge_order_mode（新）优先；老的 cross_session_time_order 仅作兼容回退
+        _mom = merged_ctx.get("merge_order_mode", None)
+        if _mom is None:
+            _mom = "time" if bool(merged_ctx.get("cross_session_time_order", True)) else "session_blocks"
+        self.merge_order_mode = str(_mom or "session_blocks").lower()
+        if self.merge_order_mode not in ("time", "session_blocks"):
+            self.merge_order_mode = "session_blocks"
+        self.cross_session_time_order = self.merge_order_mode == "time"
+        self.hard_write_through = bool(merged_ctx.get("hard_write_through", True))
+        # 双触发：tokens=合并视图估算超限；rounds=成员磁盘轮数对齐框架窗口
+        self.merge_trigger_mode = str(
+            merged_ctx.get("merge_trigger_mode", "tokens") or "tokens"
+        ).lower()
+        if self.merge_trigger_mode not in ("tokens", "rounds", "either"):
+            self.merge_trigger_mode = "tokens"
+        _mtr = merged_ctx.get("merge_trigger_rounds", 0)
+        self.merge_trigger_rounds = int(_mtr if _mtr is not None else 0)
+        # 缓存修复：time 段挪到请求队尾（否则 system 末尾的时间每分钟截断前缀缓存）
+        self.move_time_to_tail = bool(merged_ctx.get("move_time_to_tail", True))
         self.merge_build_timeout_sec = float(
-            ctx_sec.get("merge_build_timeout_sec", 5.0) or 5.0
+            merged_ctx.get("merge_build_timeout_sec", 5.0) or 5.0
         )
         if self.merge_build_timeout_sec < 1.0:
             self.merge_build_timeout_sec = 1.0
@@ -247,7 +306,7 @@ class SessionMergerPlugin(BasePlugin):
             )
         else:
             self.session_send_dedup_sec = int(
-                ctx_sec.get("session_send_dedup_sec", 25) or 0
+                merged_ctx.get("session_send_dedup_sec", 25) or 0
             )
 
         if self.session_send_dedup_sec < 0:
@@ -266,19 +325,70 @@ class SessionMergerPlugin(BasePlugin):
         summ = cfg.get("section_summarize", {})
         if not isinstance(summ, dict):
             summ = {}
+        # 兼容：这些字段新版 schema 放在 section_summary_advanced，旧版在 section_summarize
+        adv = cfg.get("section_summary_advanced", {})
+        if not isinstance(adv, dict):
+            adv = {}
+
+        def _adv_or_summ(key, default=None):
+            if key in adv:
+                return adv.get(key)
+            return summ.get(key, default)
+
         self.summarize_mode = str(summ.get("summarize_mode", "off") or "off").lower()
         if self.summarize_mode not in ("off", "sync", "async"):
             self.summarize_mode = "off"
         self.summarize_model = str(summ.get("summarize_model", "") or "")
-        self.summarize_timeout_sec = float(summ.get("summarize_timeout_sec", 30.0) or 30.0)
+        self.summarize_timeout_sec = float(summ.get("summarize_timeout_sec", 60.0) or 60.0)
         # 注意：0 是合法值（表示无上限），不能用 `or 默认值` 读取
-        _mic = summ.get("summarize_max_input_chars", 6000)
-        self.summarize_max_input_chars = int(_mic if _mic is not None else 6000)
-        _moc = summ.get("summarize_max_output_chars", 3000)
-        self.summarize_max_output_chars = int(_moc if _moc is not None else 3000)
+        _mic = summ.get("summarize_max_input_chars", 10000)
+        self.summarize_max_input_chars = int(_mic if _mic is not None else 10000)
+        _moc = summ.get("summarize_max_output_chars", 5000)
+        self.summarize_max_output_chars = int(_moc if _moc is not None else 5000)
         self.summarize_prompt_template = str(
             summ.get("summarize_prompt_template", "") or ""
         )
+        # 累积摘要（借鉴 CCS：旧摘要 + 新增量合并）
+        self.cumulative_summary = bool(summ.get("cumulative_summary", True))
+        self.merge_prompt_template = str(summ.get("merge_prompt_template", "") or "")
+        self.self_compress_prompt_template = str(
+            _adv_or_summ("self_compress_prompt_template", "") or ""
+        )
+        # 摘要输入预处理（超长 tool 结果/图片描述先压缩再摘要）
+        self.preprocess_tool_results = bool(_adv_or_summ("preprocess_tool_results", True))
+        _tmc = _adv_or_summ("tool_result_max_chars", 2000)
+        self.tool_result_max_chars = int(_tmc if _tmc is not None else 2000)
+        self.preprocess_in_sync = bool(_adv_or_summ("preprocess_in_sync", False))
+        self.merge_timeout_sec = float(_adv_or_summ("merge_timeout_sec", 120.0) or 120.0)
+        try:
+            self.preheat_ratio = float(summ.get("preheat_ratio", 0.7))
+        except (TypeError, ValueError):
+            self.preheat_ratio = 0.7
+        if self.preheat_ratio < 0:
+            self.preheat_ratio = 0.0
+        if self.preheat_ratio > 1:
+            self.preheat_ratio = 1.0
+        try:
+            self.sync_wait_timeout = float(summ.get("sync_wait_timeout", 0.0))
+        except (TypeError, ValueError):
+            self.sync_wait_timeout = 0.0
+        if self.sync_wait_timeout < 0:
+            self.sync_wait_timeout = 0.0
+        # 持续压缩合并策略
+        _cms = str(_adv_or_summ("continuous_merge_strategy", "append_then_merge") or "append_then_merge").lower()
+        if _cms not in ("immediate", "append_then_merge", "append_only"):
+            _cms = "append_then_merge"
+        self.continuous_merge_strategy = _cms
+        self.background_merge_max_concurrent = max(1, int(_adv_or_summ("background_merge_max_concurrent", 5) or 5))
+        self.background_merge_timeout_sec = max(1.0, float(_adv_or_summ("background_merge_timeout_sec", 120.0) or 120.0))
+        self.replace_concat_after_merge = bool(_adv_or_summ("replace_concat_after_merge", True))
+        self.background_merge_retry_interval_sec = max(1.0, float(_adv_or_summ("background_merge_retry_interval_sec", 30.0) or 30.0))
+        self.background_merge_max_retries = max(0, int(_adv_or_summ("background_merge_max_retries", 3) or 3))
+        self.max_concat_summary_chars = max(500, int(_adv_or_summ("max_concat_summary_chars", 5000) or 5000))
+        _cos = str(_adv_or_summ("concat_overflow_strategy", "self_compress") or "self_compress").lower()
+        if _cos not in ("self_compress", "truncate_fifo", "none"):
+            _cos = "self_compress"
+        self.concat_overflow_strategy = _cos
         # 摘要详细日志：主配置在 section_summarize；兼容旧版写在 section_debug 的同名开关
         _summ_log = summ.get("enable_summary_logging", None)
         if _summ_log is None:
@@ -307,6 +417,9 @@ class SessionMergerPlugin(BasePlugin):
             rg = [x.strip() for x in rg.split(",") if x.strip()]
         self.restricted_groups = [str(g).strip() for g in (rg or []) if str(g).strip()]
         self.cache_ttl_sec = int(hist.get("cache_ttl_sec", 30))
+        # 熔断参数：默认 60s（用户反馈 120s 太长）
+        self.circuit_fail_threshold = int(hist.get("circuit_fail_threshold", 2) or 2)
+        self.circuit_open_sec = float(hist.get("circuit_open_sec", 60.0) or 60.0)
 
         cmd = cfg.get("section_command", {})
         self.enable_status_command = bool(cmd.get("enable_status_command", False))
@@ -439,6 +552,11 @@ class SessionMergerPlugin(BasePlugin):
 
         compat = cfg.get("section_compat", {})
         self.auto_disable_ads = bool(compat.get("auto_disable_ads", False))
+        self.ccs_conflict_policy = str(
+            compat.get("ccs_conflict_policy", "disable_ccs") or "disable_ccs"
+        ).lower()
+        if self.ccs_conflict_policy not in ("disable_ccs", "disable_self", "ignore"):
+            self.ccs_conflict_policy = "disable_ccs"
 
     def _build_components(self):
 
@@ -469,6 +587,17 @@ class SessionMergerPlugin(BasePlugin):
             other_session_timeout_group=self.other_session_timeout_group,
             logger=logger,
         )
+        # 累计摘要存储（插件数据目录持久化，按成员 sid）
+        self.summary_store = None
+        try:
+            from .summarizer import CumulativeSummaryStore
+
+            self.summary_store = CumulativeSummaryStore(
+                self.data_dir / "cumulative_summaries.json"
+            )
+            self.summary_store.load()
+        except Exception as e:
+            logger.warning("[MERGER] 累计摘要存储初始化失败，降级为非累积模式: %s", e)
         self.engine = MergeEngine(
             session_mgr=self.ctx.session_mgr,
             resolver=self.resolver,
@@ -498,6 +627,28 @@ class SessionMergerPlugin(BasePlugin):
             summarize_max_output_chars=self.summarize_max_output_chars,
             summarize_prompt_template=self.summarize_prompt_template,
             enable_summary_logging=self.enable_summary_logging,
+            summary_store=self.summary_store,
+            cumulative_summary=self.cumulative_summary,
+            merge_prompt_template=self.merge_prompt_template,
+            self_compress_prompt_template=self.self_compress_prompt_template,
+            write_through=self.hard_write_through,
+            merge_order_mode=self.merge_order_mode,
+            merge_trigger_mode=self.merge_trigger_mode,
+            merge_trigger_rounds=self.merge_trigger_rounds,
+            preprocess_tools=self.preprocess_tool_results,
+            tool_max_chars=self.tool_result_max_chars,
+            preprocess_in_sync=self.preprocess_in_sync,
+            merge_timeout_sec=self.merge_timeout_sec,
+            preheat_ratio=self.preheat_ratio,
+            sync_wait_timeout=self.sync_wait_timeout,
+            continuous_merge_strategy=self.continuous_merge_strategy,
+            background_merge_max_concurrent=self.background_merge_max_concurrent,
+            background_merge_timeout_sec=self.background_merge_timeout_sec,
+            replace_concat_after_merge=self.replace_concat_after_merge,
+            background_merge_retry_interval_sec=self.background_merge_retry_interval_sec,
+            background_merge_max_retries=self.background_merge_max_retries,
+            max_concat_summary_chars=self.max_concat_summary_chars,
+            concat_overflow_strategy=self.concat_overflow_strategy,
             debug=self.enable_debug_log,
             log_preview=self.log_merged_message_preview,
             logger=logger,
@@ -511,6 +662,8 @@ class SessionMergerPlugin(BasePlugin):
             allowed_users=self.allowed_users,
             restricted_groups=self.restricted_groups,
             cache_ttl_sec=self.cache_ttl_sec,
+            circuit_fail_threshold=self.circuit_fail_threshold,
+            circuit_open_sec=self.circuit_open_sec,
             logger=logger,
         )
 
@@ -532,9 +685,23 @@ class SessionMergerPlugin(BasePlugin):
                     "合并超限模式为 hard：已自动禁用 ADS，避免与组级硬重开冲突"
                 )
 
+        # 与 CCS（ContextCondensation）互斥：soft/hard 都需要
+        # （CCS 钩子在 KSM 之后，会把合并视图镜像后写回磁盘 → 跨会话污染）
+        try:
+            ccs_result = await handle_ccs_conflict(
+                self.ctx.plugin_mgr, self.ccs_conflict_policy, logger
+            )
+            if ccs_result == "self_disabled":
+                self.enabled = False
+                logger.warning("[session_merger] 按策略 disable_self：合并功能已停用")
+        except Exception as e:
+            logger.warning("[session_merger] CCS 冲突处理失败: %s", e)
+
         logger.info(
             "会话合并初始化 enabled=%s mode=%s max_sessions=%d chunks=%d "
-            "token_limit=%d keep=%d timeout=%dm peek=%.3f group_queue=%s summarize=%s",
+            "token_limit=%d keep=%d timeout=%dm peek=%.3f group_queue=%s summarize=%s "
+            "order=%s write_through=%s cumulative=%s ccs_policy=%s trigger=%s preprocess=%s "
+            "continuous=%s@%.2f sync_wait=%.1fs",
             self.enabled,
             self.merge_reset_mode,
             self.max_merge_sessions,
@@ -545,6 +712,15 @@ class SessionMergerPlugin(BasePlugin):
             self.unmentioned_probability,
             self.enable_group_agent_queue,
             self.summarize_mode,
+            self.merge_order_mode,
+            self.hard_write_through,
+            self.cumulative_summary,
+            self.ccs_conflict_policy,
+            self.merge_trigger_mode,
+            self.preprocess_tool_results,
+            self.summarize_mode if self.summarize_mode != "off" else "off",
+            self.preheat_ratio,
+            self.sync_wait_timeout,
         )
 
     @on.loaded()
@@ -744,6 +920,11 @@ class SessionMergerPlugin(BasePlugin):
         if self.engine:
             try:
                 self.engine.cancel_summary_tasks()
+            except Exception:
+                pass
+        if self.summary_store is not None:
+            try:
+                self.summary_store.save()
             except Exception:
                 pass
         if self.group_queue:
@@ -1321,6 +1502,14 @@ class SessionMergerPlugin(BasePlugin):
                 self._session_send_dedup.clear()
             except Exception:
                 pass
+            # 累计摘要存储一并清掉（防止旧摘要污染新会话）
+            try:
+                if self.summary_store is not None:
+                    for target_sid in targets:
+                        self.summary_store.pop(target_sid)
+                    self.summary_store.save()
+            except Exception:
+                pass
 
             # 观察池一并清空（未点名缓存）
             try:
@@ -1400,12 +1589,49 @@ class SessionMergerPlugin(BasePlugin):
         except Exception as e:
             await self._reply(sid, f"预览失败: {e}")
 
+    @staticmethod
+    def _move_time_to_tail(req: LLMRequest) -> bool:
+        """把 time 段从 system prompt 挪到 user_prompt 最前（随当前消息）。
+
+        system prompt 因此跨分钟稳定，前缀缓存得以覆盖整段记忆；
+        persist=False 保证时间文本不落进会话记忆。幂等：已移动则跳过
+        （与 ADS 同装时，先跑者生效）。
+        """
+        try:
+            sys_prompts = getattr(req, "system_prompt", None) or []
+            time_p = None
+            for p in sys_prompts:
+                if getattr(p, "name", None) == "time":
+                    time_p = p
+                    break
+            if time_p is None:
+                return False
+            from core.prompt_manager import Prompt
+
+            sys_prompts.remove(time_p)
+            req.user_prompt.insert(
+                0,
+                Prompt(
+                    getattr(time_p, "content", "") or "",
+                    name="time",
+                    source=getattr(time_p, "source", "system") or "system",
+                    persist=False,
+                ),
+            )
+            return True
+        except Exception:
+            return False
+
     # ── core merge ───────────────────────────────────────────
 
     @on.llm_request(priority=Priority.LOW)
     async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if not self.enabled or not self.engine:
             return
+
+        # 缓存修复：time 段挪到队尾（幂等），让 system+记忆成为稳定前缀
+        if self.move_time_to_tail:
+            self._move_time_to_tail(req)
 
         try:
             bound = self._bind_session_send_to_request(req)
@@ -1639,6 +1865,21 @@ class SessionMergerPlugin(BasePlugin):
         except Exception:
             if self.enable_debug_log:
                 logger.exception("[MERGER] stop QQ typing failed")
+
+    @on.step_result(priority=Priority.LOW)
+    async def on_step_result_continuous_compress(self, event, *_):
+        """每次回复后检查是否需要继续后台压缩（阈值触发）。"""
+        if not self.enabled or not self.engine:
+            return
+        try:
+            sid = getattr(event, "sid", None) or getattr(
+                getattr(event, "session", None), "sid", None
+            )
+            if not sid:
+                return
+            await self.engine.post_reply_continuous_compress(sid)
+        except Exception:
+            pass
 
     # ── history tool ─────────────────────────────────────────
 

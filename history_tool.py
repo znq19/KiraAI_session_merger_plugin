@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -16,12 +17,11 @@ class HistoryToolService:
     额外：全局熔断，连续失败后短时间直接拒绝，避免拖慢 agent。
     """
 
-    CONNECT_TIMEOUT = 1.5
-    READ_TIMEOUT = 3.0
+    # 本地 OneBot 拉取历史消息（尤其群聊大 count）可能耗时数秒，
+    # 参考可用的 history_plugin 显式 timeout=10，这里按阶段拆分并留足余量。
+    CONNECT_TIMEOUT = 3.0
+    READ_TIMEOUT = 15.0
     ERROR_CACHE_TTL = 90.0
-    # 连续失败 N 次后进入熔断，直接返回错误不再打 HTTP
-    CIRCUIT_FAIL_THRESHOLD = 2
-    CIRCUIT_OPEN_SEC = 120.0
     # 同一 agent 回合内：同一目标会话最多成功返回几次（再调用直接拒绝，不塞大段历史）
     MAX_CALLS_PER_TARGET_PER_EVENT = 1
     # 同一 agent 回合内：历史工具总调用上限（含被拒绝的）
@@ -38,6 +38,8 @@ class HistoryToolService:
         allowed_users: Optional[List[str]] = None,
         restricted_groups: Optional[List[str]] = None,
         cache_ttl_sec: int = 120,
+        circuit_fail_threshold: int = 2,
+        circuit_open_sec: float = 60.0,
         logger=None,
     ):
         self.http_host = http_host or "localhost"
@@ -48,6 +50,8 @@ class HistoryToolService:
         self.allowed_users = [str(u).strip() for u in (allowed_users or []) if str(u).strip()]
         self.restricted_groups = [str(g).strip() for g in (restricted_groups or []) if str(g).strip()]
         self.cache_ttl_sec = max(0, int(cache_ttl_sec or 0))
+        self.circuit_fail_threshold = max(1, int(circuit_fail_threshold or 2))
+        self.circuit_open_sec = max(0.0, float(circuit_open_sec or 60.0))
         self.logger = logger
         self._call_cache: Dict[str, Dict[str, Any]] = {}
         self._fail_streak = 0
@@ -214,15 +218,26 @@ class HistoryToolService:
         return "…(truncated older)…\n" + cut
 
     def _note_failure(self):
+        """记录失败并进入熔断。
+
+        关键修复：熔断窗口期内再次失败时，不再把窗口重新续到未来
+        （否则会像「永远打不开」）。窗口结束后 _fail_streak 重置。
+        """
+        now = time.time()
+        if now >= self._circuit_open_until:
+            # 窗口已结束，说明这是一次新的失败序列，重置计数
+            self._fail_streak = 0
         self._fail_streak += 1
-        if self._fail_streak >= self.CIRCUIT_FAIL_THRESHOLD:
-            self._circuit_open_until = time.time() + self.CIRCUIT_OPEN_SEC
-            if self.logger:
-                self.logger.warning(
-                    "history circuit OPEN for %.0fs after %d failures",
-                    self.CIRCUIT_OPEN_SEC,
-                    self._fail_streak,
-                )
+        if self._fail_streak >= self.circuit_fail_threshold:
+            # 只在首次进入熔断时设置窗口；窗口期内不再延长
+            if now >= self._circuit_open_until:
+                self._circuit_open_until = now + self.circuit_open_sec
+                if self.logger:
+                    self.logger.warning(
+                        "history circuit OPEN for %.0fs after %d failures",
+                        self.circuit_open_sec,
+                        self._fail_streak,
+                    )
 
     def _note_success(self):
         self._fail_streak = 0
@@ -303,27 +318,27 @@ class HistoryToolService:
                 pool=self.CONNECT_TIMEOUT,
             )
 
+            url = f"{self.base_url}/{api}"
+            if self.logger:
+                self.logger.info("[history_tool] fetching %s params=%s", url, params)
+
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    f"{self.base_url}/{api}",
-                    json=params,
-                    headers=headers,
-                )
+                resp = await client.post(url, json=params, headers=headers)
                 if resp.status_code >= 400:
                     err = (
-                        f"Error: HTTP {resp.status_code} from {self.base_url}/{api}. "
+                        f"Error: HTTP {resp.status_code} from {url}/{api}. "
                         "OneBot HTTP 不可用。请勿再次调用 get_session_history，"
                         "请基于当前对话上下文回答。"
                     )
                     if self.logger:
-                        self.logger.error("Error fetching history: HTTP %s", resp.status_code)
+                        self.logger.error("Error fetching history: HTTP %s body=%s", resp.status_code, resp.text[:200])
                     self._cache_put(cache_key, 80, err, is_error=True)
                     self._note_failure()
                     return err
                 try:
                     result = resp.json()
                 except Exception as e:
-                    err = f"Error: invalid JSON from OneBot ({e})"
+                    err = f"Error: invalid JSON from OneBot ({e}) body={resp.text[:200]}"
                     self._cache_put(cache_key, 80, err, is_error=True)
                     self._note_failure()
                     return err
@@ -353,10 +368,12 @@ class HistoryToolService:
             return result_text
 
         except Exception as e:
+            tb = traceback.format_exc()
+            err_msg = f"{type(e).__name__}: {str(e) or '(no message)'}"
             if self.logger:
-                self.logger.error("Error fetching history: %s", e)
+                self.logger.error("Error fetching history: %s\n%s", err_msg, tb)
             err = (
-                f"Error: {str(e)}. "
+                f"Error: {err_msg}. "
                 "请勿再次调用 get_session_history，请基于当前对话上下文回答。"
             )
             try:
