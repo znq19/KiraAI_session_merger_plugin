@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.5.0** · 适用于 KiraAI `core >= 2.6.1`
+**版本 2.5.1** · 适用于 KiraAI `core >= 2.6.1`
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -259,6 +259,13 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.5.1
+
+- **兼容框架动态提示词重定位**：适配 KiraAI 新版 `dynamic_prompt_position` 机制（框架默认自行把 sessions/chat_env/time 挪到当前 user 消息并外包 `<system_reminder>`）。新框架默认配置下 KSM 自动让位；旧框架或该开关关闭时，KSM 复刻框架同款方式兑底挪动 time（原对象 + `persist=False` + reminder 包裹）
+- **修复时间格式化 bug**：原先挪动 time 时新建 Prompt 丢失 kwargs，模型实际看到的是字面量 `{time_str}`；现在移动原 Prompt 对象，时间正常格式化
+- `move_time_to_tail` 语义升级为「保证 time 以框架同款方式离开 system prompt」，默认开启不变；与 ADS 同装时幂等（先跑者生效）
+- 会话锚点（window anchor）随框架重定位进入 `<system_reminder>`，不再占用 system prompt，前缀缓存更稳定
 
 ### 2.5.0
 
