@@ -276,9 +276,9 @@ class SessionMergerPlugin(BasePlugin):
         _mom = merged_ctx.get("merge_order_mode", None)
         if _mom is None:
             _mom = "time" if bool(merged_ctx.get("cross_session_time_order", True)) else "session_blocks"
-        self.merge_order_mode = str(_mom or "session_blocks").lower()
+        self.merge_order_mode = str(_mom or "time").lower()
         if self.merge_order_mode not in ("time", "session_blocks"):
-            self.merge_order_mode = "session_blocks"
+            self.merge_order_mode = "time"
         self.cross_session_time_order = self.merge_order_mode == "time"
         self.hard_write_through = bool(merged_ctx.get("hard_write_through", True))
         # 双触发：tokens=合并视图估算超限；rounds=成员磁盘轮数对齐框架窗口

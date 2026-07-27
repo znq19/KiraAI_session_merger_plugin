@@ -234,8 +234,8 @@
           "session_blocks",
           "time"
         ],
-        "default": "session_blocks",
-        "hint": "session_blocks：按会话分块，当前会话在最后，前缀稳定、命中上下文缓存；time：多会话按时间交错，时序感强但缓存命中率低。"
+        "default": "time",
+        "hint": "time：多会话按时间交错成一条时间线，时序现场感强；session_blocks：按会话分块排版，当前会话块在最后。两种模式下bot看到的实际内容相同只是排版差异（全局按时间选最近 N 轮）；实测两者缓存命中率接近，请按bot的实际表现选择即可。"
       },
       "move_time_to_tail": {
         "type": "switch",

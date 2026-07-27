@@ -267,16 +267,35 @@ class MergeEngine:
             other_session_timeout_group=self.other_session_timeout_group,
         )
 
-    def _build_raw_merged(self, current_sid: str, members: List[str]) -> List[OpenAIMessage]:
-        """按 max_merged_chunks 取最近轮，不做 token 重开。
+    def _build_raw_merged(
+        self,
+        current_sid: str,
+        members: List[str],
+        round_cap: Optional[int] = None,
+    ) -> List[OpenAIMessage]:
+        """构建合并视图（选择 + 排版）。
 
-        session_blocks 模式：成员块按 sid 字典序固定、当前会话块恒在最后，
-        其他成员沉默时整个前缀逐字节稳定，利于命中模型上下文缓存。
+        选择（两种模式一致）：全局按时间竞争，保留最近 round_cap/
+        max_merged_chunks 轮——当前会话无特权，谁新谁留。
+        排版：
+        - time：时间交错；
+        - session_blocks：选出的轮按块重排——他人块按 sid 字典序在前、
+          当前会话块恒在最后。新消息只追加到自己块尾部，他人沉默时
+          前缀逐字节稳定，前缀缓存友好。
         """
-        if self.merge_order_mode == "session_blocks" and len(members) > 1:
-            others = sorted(m for m in members if m != current_sid)
-            members = others + [current_sid] if current_sid in members else others
+        cap = max(int(round_cap or self.max_merged_chunks or 1), 1)
         per_sid = max(self.max_merged_chunks, 1)
+        if self.merge_order_mode == "session_blocks" and len(members) > 1:
+            return self.timeline.build(
+                sids=members,
+                max_chunks=cap,
+                max_tokens=0,
+                enable_trim=True,
+                source_tag_mode=self.source_tag_mode,
+                per_sid_max_chunks=per_sid,
+                group_by_session=True,
+                current_sid=current_sid,
+            )
         return self.timeline.build(
             sids=members,
             max_chunks=self.max_merged_chunks,
@@ -419,7 +438,11 @@ class MergeEngine:
                 )
 
             # soft / hard 统一：合并视图轮数收到 keep（与 ADS 保留轮一致）
-            msgs = apply_round_cap(msgs, keep)
+            if self.merge_order_mode == "session_blocks":
+                # 全局选择 + 分块排版：按 keep 重建（选择截断在重排之前）
+                msgs = self._build_raw_merged(current_sid, members, round_cap=keep)
+            else:
+                msgs = apply_round_cap(msgs, keep)
             # 硬重开写入的摘要在触发本轮也应可见：
             # 轮数截断从尾部保留，首条摘要 chunk 可能被截掉，这里补回（防重）
             if summary_chunks:
@@ -465,15 +488,22 @@ class MergeEngine:
 
     def preview(self, current_sid: str, limit: int = 30) -> str:
         members = self._member_sids(current_sid)
-        return self.timeline.preview_text(
-            sids=members,
-            max_chunks=self.max_merged_chunks,
-            max_tokens=0,
-            enable_trim=True,
-            source_tag_mode=self.source_tag_mode,
-            limit=limit,
-            per_sid_max_chunks=max(self.max_merged_chunks, 1),
-        )
+        # 走与实际合并相同的构建路径（session_blocks 按块截断），预览即所见
+        msgs = self._build_raw_merged(current_sid, members)
+        lines = []
+        for i, m in enumerate(msgs[:limit]):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            if c and len(c) > 160:
+                c = c[:160] + "..."
+            extra = ""
+            if m.role == "assistant" and getattr(m, "tool_calls", None):
+                extra = f" tool_calls={len(m.tool_calls)}"
+            if m.role == "tool":
+                extra = f" id={getattr(m, 'tool_call_id', '')}"
+            lines.append(f"[{i}] {m.role}{extra}: {c}")
+        if len(msgs) > limit:
+            lines.append(f"... total {len(msgs)} messages")
+        return "\n".join(lines) if lines else "(empty)"
 
     @staticmethod
     def _role_of(msg) -> Optional[str]:

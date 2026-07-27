@@ -98,7 +98,13 @@ class TimelineBuilder:
         self,
         sids: List[str],
         per_sid_max_chunks: Optional[int] = None,
+        time_order: Optional[bool] = None,
     ) -> List[TimelineMessage]:
+        # time_order=None 用构造默认；显式 True/False 覆盖（session_blocks
+        # 的「全局选择」需要强制时间序，选择与排版解耦）
+        use_time_order = (
+            self.cross_session_time_order if time_order is None else time_order
+        )
         result: List[TimelineMessage] = []
         order = 0
         for sid_index, sid in enumerate(sids):
@@ -164,7 +170,7 @@ class TimelineBuilder:
                 if ts <= 0:
                     ts = session_ts
 
-                if self.cross_session_time_order:
+                if use_time_order:
                     sort_key = (ts, sid_index, in_idx, order)
                 else:
                     sort_key = (sid_index, in_idx, order)
@@ -185,13 +191,13 @@ class TimelineBuilder:
 
         # 按「轮」原子排序：同一 sid 内 user→assistant/tool 链不拆开，
         # 避免跨会话时间交错把 tool 链切断导致模型重复调工具。
-        result = self._sort_preserving_round_atoms(result)
+        result = self._sort_preserving_round_atoms(result, time_order=use_time_order)
         for i, m in enumerate(result):
             m.order = i
         return result
 
     def _sort_preserving_round_atoms(
-        self, msgs: List[TimelineMessage]
+        self, msgs: List[TimelineMessage], time_order: Optional[bool] = None
     ) -> List[TimelineMessage]:
         """
         先按 sid 内原始顺序切成轮（user 起头），轮内顺序不变；
@@ -199,7 +205,10 @@ class TimelineBuilder:
         """
         if not msgs:
             return []
-        if not self.cross_session_time_order:
+        use_time_order = (
+            self.cross_session_time_order if time_order is None else time_order
+        )
+        if not use_time_order:
             # 非交错：保持 collect 时的 sid 分段顺序即可
             return msgs
 
@@ -458,6 +467,22 @@ class TimelineBuilder:
                 result.append(OpenAIMessage(role=m.role, content=content))
         return result
 
+    @staticmethod
+    def _regroup_by_session(
+        msgs: List[TimelineMessage], current_sid: str
+    ) -> List[TimelineMessage]:
+        """全局选择后按块重排（session_blocks 排版）：
+        他人块按 sid 字典序在前，当前会话块恒在最后；
+        块内保持全局时间序（sorted 稳定 + order 递增）。
+        新消息只追加到自己块尾部，他人沉默时前缀逐字节稳定。"""
+
+        def block_key(m: TimelineMessage):
+            if current_sid and m.source_sid == current_sid:
+                return (1, "")
+            return (0, m.source_sid or "")
+
+        return sorted(msgs, key=lambda m: (block_key(m), m.order))
+
     def build(
         self,
         sids: List[str],
@@ -466,14 +491,23 @@ class TimelineBuilder:
         enable_trim: bool = True,
         source_tag_mode: str = "prefix",
         per_sid_max_chunks: Optional[int] = None,
+        group_by_session: bool = False,
+        current_sid: str = "",
     ) -> List[OpenAIMessage]:
         self._title_cache.clear()
         if per_sid_max_chunks is None:
             per_sid_max_chunks = max_chunks if max_chunks and max_chunks > 0 else None
-        raw = self.collect_from_sessions(sids, per_sid_max_chunks=per_sid_max_chunks)
+        raw = self.collect_from_sessions(
+            sids,
+            per_sid_max_chunks=per_sid_max_chunks,
+            # session_blocks：选择与 time 一致（全局时间竞争），仅排版不同
+            time_order=True if group_by_session else None,
+        )
         cleaned = self.sanitize_tool_pairs(raw)
         chunks = self.rebuild_chunks(cleaned)
         trimmed = self.trim_chunks(chunks, max_chunks, max_tokens, enable_trim)
+        if group_by_session:
+            trimmed = self._regroup_by_session(trimmed, current_sid)
         return self.to_openai_messages(trimmed, source_tag_mode)
 
     def preview_text(

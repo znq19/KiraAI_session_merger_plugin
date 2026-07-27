@@ -1,7 +1,7 @@
 {
   "plugin_id": "kira_session_merger",
   "display_name": "会话合并",
-  "version": "2.5.1",
+  "version": "2.6.0",
   "author": "znq19",
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.5：时间队尾化修复前缀缓存、双触发+预算驱动降级、累积摘要、硬重开写穿、与 CCS 互斥。",
   "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
