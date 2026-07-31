@@ -7,7 +7,7 @@ from __future__ import annotations
 通过 publish_notice(is_mentioned=True) 切入目标会话正常 agent 流程。
 """
 
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from core.chat import MessageChain
 from core.chat.message_elements import Text
@@ -102,6 +102,96 @@ def build_route_dedup_message(target: str = "") -> str:
     )
 
 
+def list_enabled_adapters(ctx) -> List[Tuple[str, str]]:
+    """枚举启用中且已加载的 adapter：[(name, platform)]。失败返回 []。"""
+    mgr = getattr(ctx, "adapter_mgr", None)
+    if mgr is None:
+        return []
+    try:
+        infos = mgr.get_adapters_info()
+    except Exception:
+        infos = []
+    out: List[Tuple[str, str]] = []
+    for info in infos or []:
+        try:
+            if not getattr(info, "enabled", False):
+                continue
+            name = str(
+                getattr(info, "name", "") or getattr(info, "adapter_id", "") or ""
+            )
+            if not name:
+                continue
+            if mgr.get_adapter(name) is None:
+                continue
+            out.append((name, str(getattr(info, "platform", "") or "")))
+        except Exception:
+            continue
+    return out
+
+
+def resolve_target_sid(ctx, target: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    校正 target 的 adapter 前缀（LLM 可能照工具描述示例脑补前缀）。
+    返回 (sid, None) 或 (None, 可读错误)。
+    规则（全部确定性，无猜测）：
+      1. adapter 存在 → 原样通过；
+      2. 会话列表按 *:type:id 反查，唯一命中 → 用真实 sid；
+      3. 启用中的 adapter 仅 1 个 → 直接替换前缀；
+      4. 否则拒绝并返回可用 adapter 候选，让 LLM 重试。
+    """
+    parts = (target or "").split(":")
+    if len(parts) != 3 or not all(parts):
+        return None, "failed: invalid target sid (expect adapter:type:id)"
+    ada_name, st, sid = parts
+    mgr = getattr(ctx, "adapter_mgr", None)
+    if mgr is None:
+        return target, None  # 无法校验，按原样投递
+    try:
+        if mgr.get_adapter(ada_name) is not None:
+            return target, None
+    except Exception:
+        return target, None
+
+    adapters = list_enabled_adapters(ctx)
+
+    # 2) 会话列表反查 *:type:id 唯一命中
+    found = set()
+    sm = getattr(ctx, "session_mgr", None)
+    if sm is not None:
+        try:
+            valid = {n for n, _ in adapters}
+            for info in sm.get_session_info() or []:
+                s = str(getattr(info, "sid", "") or "")
+                p = s.split(":")
+                if (
+                    len(p) == 3
+                    and p[1] == st
+                    and p[2] == sid
+                    and p[0] != ada_name
+                    and p[0] in valid
+                ):
+                    found.add(s)
+        except Exception:
+            pass
+    if len(found) == 1:
+        return found.pop(), None
+
+    # 3) 启用 adapter 唯一 → 直改前缀（覆盖首次触达、会话列表无记录的场景）
+    if len(adapters) == 1:
+        return f"{adapters[0][0]}:{st}:{sid}", None
+
+    # 4) 歧义或无候选 → 可读错误，引导 LLM 用正确前缀重试
+    if not adapters:
+        return None, f"failed: no enabled adapter; cannot route to {target}"
+    cand = ", ".join(f"{n}({pf})" if pf else n for n, pf in adapters)
+    return None, (
+        f"failed: adapter '{ada_name}' not found. "
+        f"Available adapters: {cand}. "
+        f"Retry with target like '{adapters[0][0]}:{st}:{sid}', "
+        "copied verbatim from the session list."
+    )
+
+
 async def route_cross_session_request(
     ctx,
     source_sid: str,
@@ -113,9 +203,16 @@ async def route_cross_session_request(
     将跨会话请求路由到目标会话并激活 LLM。
     返回 (ok, tool_result_message)
     """
-    parts = (target or "").split(":")
-    if len(parts) != 3:
-        return False, "failed: invalid target sid (expect adapter:type:id)"
+    resolved, err = resolve_target_sid(ctx, target)
+    if err:
+        if logger:
+            logger.warning(
+                "[MERGER] route rejected %s -> %s: %s", source_sid, target, err
+            )
+        return False, err
+    if resolved != target and logger:
+        logger.info("[MERGER] route target corrected %s -> %s", target, resolved)
+    target = resolved
 
     if source_sid and source_sid == target:
         return False, (

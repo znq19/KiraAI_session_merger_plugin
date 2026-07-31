@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.6.0** · 适用于 KiraAI `core >= 2.6.1`
+**版本 2.6.1** · 适用于 KiraAI `core >= 2.6.1`
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -277,6 +277,12 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.6.1
+
+- **修复跨会话路由 `Failed to get adapter` 报错**：适配器实例名不是 `qq` 时（如 `55`），LLM 照工具描述里的 `qq:` 示例拼接 target，路由直接抛异常。新增 `resolve_target_sid` 确定性校正：会话列表按 `*:type:id` 反查唯一命中 → 用真实 sid；启用中的 adapter 仅 1 个 → 直接替换前缀；有歧义才拒绝并返回候选 adapter 列表引导 LLM 重试
+- **提示词去硬编码 `qq` 前缀**：session_send 重写 description 与 tip 示例按本机启用的 adapter 动态生成，并强调「从会话列表原样复制完整 target，勿自行拼接前缀」；`get_session_history` 的 session_id 说明同步改为通用 `adapter:gm:群号 / adapter:dm:对方号`
+- **「允许的适配器」默认改为留空（不限制）**：不再默认预填 `qq`；hint 说明填的是适配器实例名（会话 sid 第一段，如 `55:gm:123` 中的 `55`，可在 WebUI 适配器配置里查看）。已有配置的用户不受影响（保留原值）
 
 ### 2.6.0
 

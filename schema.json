@@ -26,10 +26,8 @@
       "allowed_adapters": {
         "type": "list",
         "name": "允许的适配器",
-        "default": [
-          "qq"
-        ],
-        "hint": "只合并这些适配器下的会话，一般填 qq；留空表示不限制。"
+        "default": [],
+        "hint": "填适配器实例名（即会话 sid 的第一段，如 55:gm:123 中的 55），可在 WebUI 适配器配置里查看名称。只合并这些适配器下的会话；留空表示不限制（推荐）。"
       },
       "merge_all_groups": {
         "type": "switch",

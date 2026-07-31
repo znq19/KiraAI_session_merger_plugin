@@ -24,6 +24,7 @@ from .cross_session import (
     event_has_handoff,
     is_merge_route_request_text,
     is_route_handoff_result,
+    list_enabled_adapters,
     mark_event_handoff,
     route_cross_session_request,
 )
@@ -51,7 +52,7 @@ class SessionMergerPlugin(BasePlugin):
 
         # mode
         self.enabled = False
-        self.allowed_adapters: List[str] = ["qq"]
+        self.allowed_adapters: List[str] = []
         self.merge_all_groups = True
         self.merge_all_dms = True
         self.merge_groups_with_dms = True
@@ -200,7 +201,7 @@ class SessionMergerPlugin(BasePlugin):
 
         mode = cfg.get("section_mode", {})
         self.enabled = bool(mode.get("enabled", False))
-        adapters = mode.get("allowed_adapters", ["qq"])
+        adapters = mode.get("allowed_adapters", [])
         if isinstance(adapters, str):
             adapters = [adapters]
         self.allowed_adapters = [str(a).strip() for a in adapters if str(a).strip()]
@@ -878,6 +879,18 @@ class SessionMergerPlugin(BasePlugin):
         )
         wrapped_session_send._merger_session_send_original = original  # type: ignore
         llm_api.tools_functions["session_send"] = wrapped_session_send
+        # target 示例按本机启用中的 adapter 动态生成，避免 LLM 照抄不存在的 qq 前缀
+        target_examples = "target 从会话列表原样复制，勿自行拼接前缀"
+        try:
+            ads = list_enabled_adapters(self.ctx)
+            if ads:
+                a0 = ads[0][0]
+                target_examples = (
+                    f"target 如 {a0}:dm:123 / {a0}:gm:456"
+                    "（务必从会话列表原样复制完整 target，勿自行拼接前缀）"
+                )
+        except Exception:
+            pass
         try:
             for td in getattr(llm_api, "tools_definitions", []) or []:
                 fn = td.get("function") or {}
@@ -886,7 +899,7 @@ class SessionMergerPlugin(BasePlugin):
                         "【合并模式·跨会话请求】切换到目标会话，带着合并上文继续执行。"
                         "仅当 target ≠ 当前会话时使用；当前会话请直接输出 xml。"
                         "用户说「去群里/去私聊/到某会话聊」或任务应在另一会话完成时，应主动调用。"
-                        "target 如 qq:dm:123 / qq:gm:456（可从会话列表复制）。"
+                        f"{target_examples}。"
                         "成功后任务交给目标会话；不要在源会话替目标执行业务工具；"
                         "同一目标短时间勿重复调用。"
                     )
@@ -1728,6 +1741,15 @@ class SessionMergerPlugin(BasePlugin):
             return
 
         try:
+            # 本机 adapter 前缀示例（当前 event 的 sid 前缀最准）
+            cur_prefix = ""
+            try:
+                cur_prefix = (getattr(event, "sid", "") or "").split(":", 1)[0]
+            except Exception:
+                cur_prefix = ""
+            prefix_hint = (
+                f"（本机示例：{cur_prefix}:gm:群号）" if cur_prefix else ""
+            )
             tip2 = (
                 "\n[Session Merger] session_send = 跨会话请求（合并模式）："
                 "切换到目标会话，目标带着合并上文继续执行。\n"
@@ -1735,6 +1757,8 @@ class SessionMergerPlugin(BasePlugin):
                 "- 用户要求换会话，或任务须在另一会话完成\n"
                 "### 行为\n"
                 "- session_send(target, description=要在目标完成的事)；"
+                "target 从会话列表原样复制，勿自行拼接前缀"
+                f"{prefix_hint}；"
                 "成功后勿在源会话替目标调业务工具；可简短确认也可不发；同一 target 一次即可\n"
                 "### 不要 session_send\n"
                 "- 目标就是当前会话 → 直接输出 xml / 在本会话调工具\n"
@@ -1919,14 +1943,14 @@ class SessionMergerPlugin(BasePlugin):
             "通过 OneBot HTTP 拉取群/私聊平台真历史（含更早记录、msg_id、图片 URL）。"
             "合并模式下近期上下文已注入：仅当需要更早/平台侧记录时再查；"
             "同一目标每回合最多成功查 1 次，返回 Rejected/Error 后禁止再调。"
-            "session_id：qq:gm:群号 / qq:dm:QQ号。"
+            "session_id 从会话列表原样复制（adapter:gm:群号 / adapter:dm:对方号）。"
         ),
         params={
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "会话 ID：qq:gm:123456 或 qq:dm:789 或纯数字",
+                    "description": "会话 ID：adapter:gm:123456 或 adapter:dm:789（从会话列表原样复制）或纯数字",
                 },
                 "count": {
                     "type": "integer",
