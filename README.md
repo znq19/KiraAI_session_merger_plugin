@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.6.6** · 适用于 KiraAI `core >= 2.29.6`
+**版本 2.7.0** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -281,6 +281,17 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.7.0
+
+- **适配 KiraAI v2.34.2**：框架移除了 `SessionManager.max_memory_length` 实例属性（改为按
+  `memory_overflow_discard_count` 成批丢弃）。本插件 `_rounds_limit()` 原先读该属性，
+  属性消失后会**静默回落到硬编码 10** —— `rounds` / `either` 模式下若把轮数填 `0`
+  （对齐框架窗口），「成员会话轮数是否达到框架窗口」的判断会从真实窗口（例如 50）变成 10，
+  **合并触发明显提前**。现在新增 `_host_window()`：**老属性 → `kira_config` 配置 →
+  框架 `_get_memory_limits()`**，逐级兜底，新旧框架都对。
+- **顺带确认**：本插件 wrap 的 `session_mgr.update_memory` 在 v2.34.2 里**签名未变**，
+  落盘后释放组锁的逻辑依然有效；`write_memory` / `fetch_memory` 也不受影响。
 
 ### 2.6.9
 
