@@ -164,6 +164,42 @@ check("SnowLuma cap 800", onebot_compat.resolve_impl("SnowLuma")["max_scan_limit
 check("LLOneBot page cap 30 (its own hard limit)",
       onebot_compat.resolve_impl("LLOneBot")["max_page"] == 30)
 
+print("\n[self-import style: 自家模块必须相对导入]")
+# ============================================================================
+# v2.8.1 事故防复发：框架以「包」的形式加载插件（plugins.<dir>.main），
+# 插件目录**不在 sys.path** 上，因此自家兄弟模块只能用相对导入
+# （from .group_agent_queue import ...）。
+# 一旦写成绝对导入（from group_agent_queue import ...），模块导入阶段或许看不出来，
+# 但只要那段代码跑在 initialize()/_load_cfg() 里 → 插件直接初始化失败：
+#     ERROR [plugin_manager] Failed to initialize plugin kira_session_merger:
+#     No module named 'group_agent_queue'
+# 这里做静态扫描，成本为零、且不需要框架环境。
+# ============================================================================
+import re as _re
+_OWN_MODULES = {f[:-3] for f in os.listdir(ROOT)
+                if f.endswith(".py")} - {"__init__", "main"}
+_ABS_SELF_IMPORT = _re.compile(r"^\s*(?:from\s+([A-Za-z_]\w*)\s+import|import\s+([A-Za-z_]\w*))")
+_offenders = []
+for _fname in sorted(f for f in os.listdir(ROOT) if f.endswith(".py")):
+    _py = os.path.join(ROOT, _fname)
+    with open(_py, encoding="utf-8", errors="ignore") as _fh:
+        _lines = _fh.read().splitlines()
+    for _i, _line in enumerate(_lines, 1):
+        _stripped = _line.strip()
+        if _stripped.startswith("#"):
+            continue
+        _m = _ABS_SELF_IMPORT.match(_line)
+        if not _m:
+            continue
+        _name = _m.group(1) or _m.group(2)
+        if _name in _OWN_MODULES:
+            _offenders.append(f"{_fname}:{_i}: {_stripped[:70]}")
+check("自家模块无绝对导入（{} 个模块）".format(len(_OWN_MODULES)), not _offenders,
+      "; ".join(_offenders[:3]))
+if _offenders:
+    for _o in _offenders:
+        print("        ✗", _o)
+
 print()
 passed = sum(1 for _, ok in results if ok)
 print("TOTAL %d/%d passed" % (passed, len(results)))

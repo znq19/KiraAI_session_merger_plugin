@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.8.1** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
+**版本 2.8.2** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -370,6 +370,28 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.8.2
+
+- **热修：v2.8.1 引入的模块导入错误导致插件初始化失败**
+  - **现象**：升级到 v2.8.1 后日志出现
+    `ERROR [plugin_manager] Failed to initialize plugin kira_session_merger: No module named 'group_agent_queue'`，
+    插件被禁用（聊天照常，只是不再跨会话合并）。
+  - **根因**：v2.8.1 在 `_load_cfg` 里新增 `resolve_settle_sec()` 调用时写成了**绝对导入**
+    （`from group_agent_queue import …`）。框架以「包」的形式加载插件
+    （包名 `plugins.<目录名>`、主模块 `plugins.<目录名>.main`），**插件目录不在 `sys.path` 上**，
+    插件内引用自家兄弟模块只能用**相对导入**（`from .group_agent_queue import …`）——
+    本仓库其余 16 个模块一直如此，这次是唯一例外；由于它跑在 `initialize()` 的调用链里，
+    模块导入阶段看不出来，一进初始化就炸。
+  - **修复**：改为并入文件顶部的相对导入
+    （`from .group_agent_queue import GroupAgentQueue, resolve_settle_sec`）。
+  - **防复发**：`tests/test_consistency.py` 新增静态守卫
+    「自家模块无绝对导入」——扫描全部 17 个模块，任何 `from <自家模块> import …` /
+    `import <自家模块>` 都会被判 FAIL 并点名到行（已做反向验证：把绝对导入注回去立即报红）。
+  - **验证**：新增 `repro` 式检查「框架式包加载（`plugins.<dir>.main`，插件目录不在
+    sys.path）→ 导入主模块 → 执行 `_load_cfg()`」；修复前复现
+    `ModuleNotFoundError: No module named 'group_agent_queue'`，修复后通过。
+  - 说明：你的配置文件未被这次事故改动（初始化在写回之前就失败了），升级到 2.8.2 即可正常。
 
 ### 2.8.1
 

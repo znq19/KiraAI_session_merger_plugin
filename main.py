@@ -28,7 +28,7 @@ from .cross_session import (
     mark_event_handoff,
     route_cross_session_request,
 )
-from .group_agent_queue import GroupAgentQueue
+from .group_agent_queue import GroupAgentQueue, resolve_settle_sec
 from .group_resolver import GroupResolver
 from .history_tool import HistoryToolService
 from .merge_engine import MergeEngine
@@ -575,7 +575,9 @@ class SessionMergerPlugin(BasePlugin):
         # v2.8.1：settle 默认 0.4 → 0（组锁释放发生在 update_memory 同步落盘之后，
         # 立即调度是安全的；旧默认 0.4 只留下"显示与实际不一致"）。存量配置迁移见
         # resolve_settle_sec() 与 _migrate_settle_config()。
-        from group_agent_queue import resolve_settle_sec
+        # ⚠ resolve_settle_sec 必须走**相对导入**（见文件顶部 import）：框架把插件目录当
+        #   包加载（plugins.<dir>.main），插件目录不在 sys.path 上，绝对导入会
+        #   ModuleNotFoundError → initialize 直接失败（v2.8.1 事故，v2.8.2 修复）。
         self.group_agent_settle_sec, self._settle_needs_migration = resolve_settle_sec(
             _q_get("group_agent_settle_sec", None)
         )
