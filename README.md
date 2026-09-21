@@ -234,7 +234,7 @@ KiraAI 默认行为：**每个群聊、每个私聊各自独立记忆**，换一
 | 项目 | 默认 | 说明 |
 |------|------|------|
 | 合并组单一Agent队列 | 开 | 组内排队串行 |
-| 组锁超时 | 180秒 | 锁超时自动释放（正常/交棒/批次阶段被停等路径都会更快释放，仅异常兜底时才等到这里） |
+| 组锁超时 | 180秒 | 锁超时自动释放（正常/交棒/批次阶段被停等路径都会更快释放，仅异常兜底时才等到这里）。**必须 > 预期最长一轮 agent 运行时间（含工具循环）**，否则 TTL 强放锁后重放批次会撞上仍在跑的一轮（并行轮，打破组内单窗口）；建议 ≥600。插件启动时若检测到 ttl ≤（LLM 超时 + 工具超时）会打 warning |
 | 队列最大长度 | 32 | 排队上限 |
 
 ### 历史查询工具
@@ -370,6 +370,64 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.8.3
+
+- **🔴 修复：组队列重放死锁（P0，排队消息滞留 180s 甚至被丢弃）**
+  - **机制**：`pop_next_and_begin` 取出队首即占锁（`running=True, active_event_id=""`），
+    drain 授权新 event 并发布后，重放批次走到 `try_begin` 授权分支发现
+    「锁仍被占且未过期」→ 误判重新入队 + `stop()`；而重放监听器在「授权已消费」分支
+    退出**不放锁** → 幻影锁挂到 TTL 180s，循环饿死，队列积满 32 后丢弃最旧消息。
+  - **修复**：`try_begin` 授权分支区分「`pop_next_and_begin` 为本次重放预留的占位锁」
+    （running 但 `active_event_id` 为空且 sid 匹配）与「别人真实占用的锁」——
+    占位锁直接接管，真占用才重新入队。
+  - **回归测试**：`tests/test_replay_stop_release.py` 新增 T8/T9——走**真实 `try_begin`**
+    验证「A 运行 → B 入队 → A 释放 → drain 占位锁 → 授权重放 → try_begin=True」
+    （修复前 FAIL，修复后 PASS；现有 T1 用 `consume_authorization` 绕过真实路径所以漏掉），
+    以及「授权批次撞上别人真实占锁仍重新入队不丢消息」。
+
+- **修复：观察池无视 discard（黑名单内容泄漏进合并上下文）**
+  - S/Z 等前置插件（HIGH）对拉黑/抑制消息的 `event.discard()` 不会中断 handler 链，
+    被拉黑用户的消息仍进观察池并可能被"偷看"注入合并组 LLM 上下文。
+  - `on_im_message_observe` 增加 `process_strategy == "discard"` 检查，已丢弃消息直接跳过。
+
+- **修复：`threading.Lock` 冻结事件循环（P1）**
+  - 后台摘要写回 / `_write_summary_to_memory`（被 `apply_to_request` 在 ON_LLM_REQUEST
+    关键路径调用）/ 手动压缩重开三处都在事件循环里对 `threading.Lock` 做阻塞获取，
+    而持锁方可能在 `to_thread` 里做 N×全量落盘 → 整个事件循环冻结秒级。
+  - 新增 `_async_reset_lock()` 异步上下文管理器：锁本体仍是 `threading.Lock`
+    （不与 asyncio.Lock 混用），只把「获取」挪进 worker 线程；事件循环路径上的
+    同步全量落盘（`write_memory` / 手动 `hard_reset_members`）一并包进 `to_thread`。
+    `to_thread` 内（`_apply_sync`）的持锁段保持不变。
+
+- **修复：预热任务超时丢引用（重复后台压缩叠加）**
+  - `_harvest_continuous_compression` 的 `wait_for(shield(task))` 超时后从
+    `_preheat_tasks` 摘除但任务仍在跑 → 下次调度再起一个 → 同 sid 叠加多个后台压缩。
+  - 改为超时保留注册（任务完成回调里自检清理，仅当注册表仍指向本任务时才摘除）；
+    选「保留」而非 `cancel()`：取消会浪费已经花掉的 LLM 摘要费用。
+
+- **修复：跨会话 session_send 乒乓（A→B→A 每跳一轮 LLM 费用）**
+  - 路由正文新增 `hop` 计数（旧格式按 1 兼容；`[merge_cross_session_request]`
+    识别标记不变），hop ≥ 2 拒绝投递并记 warning；
+  - 去重键由有向 `(source, target)` 改为无向 `frozenset({source, target})`（TTL 25s 不变）。
+
+- **提速：历史工具 get_msg 批量刷新并行化**
+  - `_MAX_REFRESH=10` 的刷新循环原先串行 `await`（单次超时 15s，最坏 ~150s），
+    改 `asyncio.gather` 并行（保持结果按下标映射回原位置，顺序不变），单批次最坏 ≈15s。
+
+- **提速：观察池节流落盘不再卡事件循环**
+  - 观察池 flush 的同步 `write_text(json.dumps)` 挪到 worker 线程（写前快照，
+    防与 add 并发）；`flush(force=True)` 语义不变。
+
+- **治理：若干 per-group 字典无界增长**
+  - 重放监听器 TTL 兜底退出时丢弃对应授权（`_authorized_event_ids`）；
+  - 组锁释放后若队列空且未运行，删除该组状态（`_states`）；
+  - `_reset_locks` 超 256 时淘汰未持有的锁；`_soft_state` 三张表超 512 时
+    惰性淘汰 7 天未活跃的组。
+
+- **文档/告警：组锁 TTL 必须 > 预期最长一轮 agent（含工具循环）**
+  - README 明确建议 `group_agent_lock_ttl_sec` ≥ 600；插件 on_loaded 时若
+    ttl ≤（LLM 超时 + 工具超时）打 warning（默认值 180 未改，保持向后兼容）。
 
 ### 2.8.2
 

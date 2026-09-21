@@ -187,8 +187,51 @@ async def t7_settle_migration():
     check("S7 字符串 0.4 也按旧默认迁移", resolve_settle_sec("0.4") == (0.0, True))
 
 
+async def t8_replay_takes_placeholder_lock():
+    """v2.8.3 回归：重放批次走**真实 try_begin** 必须能接管占位锁。
+
+    现有 T1 用 consume_authorization() 手动模拟"已接手"，绕过了真实
+    try_begin 路径，所以漏掉了这个 P0：pop_next_and_begin 占锁（running=True,
+    active_event_id=""）→ drain 授权新 event → try_begin 授权分支误判"锁仍被占"
+    → 重新入队 + stop → watch 在"授权已消费"分支退出不放锁 → 幻影锁挂到 TTL。
+    """
+    q = GroupAgentQueue(enabled=True, lock_ttl_sec=180, settle_sec=0, logger=None)
+    gid = "g1"
+    ev_a = FakeEvent("ev-a")
+    ev_b = FakeEvent("ev-b")
+    assert await q.try_begin(gid, "qq:gm:111", ev_a) is True       # A 占锁运行
+    assert await q.try_begin(gid, "qq:gm:222", ev_b) is False      # B 入队
+    await q.release_if_active(gid, sid="qq:gm:111", reason="test") # A 落盘后释放
+    pending = await q.pop_next_and_begin(gid)                      # drain：占位锁
+    assert pending is not None and pending.sid == "qq:gm:222"
+    replay = FakeEvent("ev-replay-8")                              # 重放批次（新 event_id）
+    q.authorize_event(replay.event_id)
+    ok = await q.try_begin(gid, "qq:gm:222", replay)               # 真实 try_begin
+    check("T8 重放批次接管占位锁 → try_begin=True（修复前 FAIL）", ok)
+    st = q._state(gid)
+    check("T8 锁归属重放 event", st.running and st.active_event_id == "ev-replay-8")
+    check("T8 未发生重新入队（队列空）", q.queue_len(gid) == 0)
+    q.clear_all()
+
+
+async def t9_authorized_reenqueue_when_foreign_lock():
+    """授权批次撞上**别人真实占用的锁**（带 active_event_id）仍应重新入队。"""
+    q = GroupAgentQueue(enabled=True, lock_ttl_sec=180, settle_sec=0, logger=None)
+    gid = "g1"
+    ev_a = FakeEvent("ev-a")
+    assert await q.try_begin(gid, "qq:gm:111", ev_a) is True       # 别的批次真实占锁
+    replay = FakeEvent("ev-replay-9")
+    q.authorize_event(replay.event_id)
+    ok = await q.try_begin(gid, "qq:gm:222", replay)
+    check("T9 锁被别的批次真实占用 → 授权批次重新入队", not ok)
+    check("T9 已入队等待（不丢消息）", q.queue_len(gid) == 1)
+    q.clear_all()
+
+
 async def main():
     await t7_settle_migration()
+    await t8_replay_takes_placeholder_lock()
+    await t9_authorized_reenqueue_when_foreign_lock()
     await t1_consumed_no_release()
     await t2_stopped_releases_early()
     await t3_not_stopped_no_release()

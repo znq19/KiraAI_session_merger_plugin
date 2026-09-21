@@ -4,6 +4,7 @@ import asyncio
 import random
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
 
 from core.agent.message import OpenAIMessage
@@ -208,9 +209,44 @@ class MergeEngine:
                 pass
 
     def _get_reset_lock(self, group_id: str) -> threading.Lock:
-        if group_id not in self._reset_locks:
-            self._reset_locks[group_id] = threading.Lock()
-        return self._reset_locks[group_id]
+        lock = self._reset_locks.get(group_id)
+        if lock is None:
+            # 内存治理：长期运行下按 group 无界增长，超上限时淘汰当前未持有的锁
+            if len(self._reset_locks) >= 256:
+                for gid, old in list(self._reset_locks.items()):
+                    if not old.locked():
+                        self._reset_locks.pop(gid, None)
+            lock = threading.Lock()
+            self._reset_locks[group_id] = lock
+        return lock
+
+    @asynccontextmanager
+    async def _async_reset_lock(self, group_id: str):
+        """事件循环侧获取 per-group 重开锁（锁本体始终是 threading.Lock）。
+
+        只把「阻塞获取」挪进 worker 线程（to_thread），持锁方在 to_thread 里做
+        N×全量落盘时不再冻结整个事件循环；to_thread 内的持锁段保持不变。
+        不在 asyncio.Lock 与 threading.Lock 间混用同一把锁。
+        """
+        lock = self._get_reset_lock(group_id)
+        # shield：外层 cancel 打不断 worker 线程里的 acquire；若真被取消，
+        # 补一个「拿到锁后配对释放」的回调，防锁泄漏（否则该组锁永久被占）
+        acquire_task = asyncio.ensure_future(asyncio.to_thread(lock.acquire))
+        try:
+            await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            def _pair_release(fut):
+                if not fut.cancelled() and fut.exception() is None:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
+            acquire_task.add_done_callback(_pair_release)
+            raise
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _host_window(self) -> int:
         """框架会话窗口（chunk 数）。
@@ -776,7 +812,9 @@ class MergeEngine:
             if self.enable_summary_logging and self.logger:
                 self.logger.info("[摘要调试] [持续压缩] %s 异常（静默）: %s", sid, e)
         finally:
-            self._preheat_tasks.pop(sid, None)
+            # 自检清理：仅当注册表仍指向本任务时摘除（收割方超时后不再代删）
+            if self._preheat_tasks.get(sid) is asyncio.current_task():
+                self._preheat_tasks.pop(sid, None)
 
     def _concat_parts(self, parts):
         """把摘要片段列表拼接成最终文本（过滤空片段）。"""
@@ -842,7 +880,7 @@ class MergeEngine:
         if not new_final or not self.session_mgr:
             return False
         try:
-            with self._get_reset_lock(group_id):
+            async with self._async_reset_lock(group_id):
                 chunks = self.session_mgr.read_memory(sid) or []
                 cur_head = ""
                 if chunks and is_summary_chunk(chunks[0]):
@@ -858,7 +896,8 @@ class MergeEngine:
                     chunks[0] = [summary_msg] + list(chunks[0])
                 else:
                     chunks = [[summary_msg]]
-                self.session_mgr.write_memory(sid, chunks)
+                # write_memory 是同步全量 JSON 落盘，挪到线程避免冻结事件循环
+                await asyncio.to_thread(self.session_mgr.write_memory, sid, chunks)
             self._update_store_after_reset([sid], {sid: new_final})
             if self.logger:
                 self.logger.info(
@@ -1038,8 +1077,12 @@ class MergeEngine:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass
-        self._preheat_tasks.pop(sid, None)
+                # 超时只是调用方等不及：任务仍在跑，保留注册防止下次调度
+                # 再起一个同 sid 叠加（重复 LLM 费用）；任务完成后自行清理
+                return self._preheat_pending.get(sid)
+        # 任务已完成：仅当注册表仍指向它时才摘除（防误删后继任务）
+        if self._preheat_tasks.get(sid) is task:
+            self._preheat_tasks.pop(sid, None)
         return self._preheat_pending.get(sid)
 
     def _preheat_valid_final(
@@ -1102,12 +1145,12 @@ class MergeEngine:
             finals.update(more)
         return finals, missing
 
-    def _write_summary_to_memory(self, sid: str, final: str, group_id: str):
+    async def _write_summary_to_memory(self, sid: str, final: str, group_id: str):
         """将已生成的累计摘要写回会话记忆首部（带重开锁）。"""
         if not final or not self.session_mgr:
             return
         try:
-            with self._get_reset_lock(group_id):
+            async with self._async_reset_lock(group_id):
                 chunks = self.session_mgr.read_memory(sid) or []
                 summary_msg = build_summary_chunk(final)[0]
                 if chunks and is_summary_chunk(chunks[0]):
@@ -1116,7 +1159,8 @@ class MergeEngine:
                     chunks[0] = [summary_msg] + list(chunks[0])
                 else:
                     chunks = [[summary_msg]]
-                self.session_mgr.write_memory(sid, chunks)
+                # write_memory 是同步全量 JSON 落盘，挪到线程避免冻结事件循环
+                await asyncio.to_thread(self.session_mgr.write_memory, sid, chunks)
             self._update_store_after_reset([sid], {sid: final})
             if self.logger:
                 self.logger.info("[MERGER summary] async summary written for %s", sid)
@@ -1377,7 +1421,7 @@ class MergeEngine:
                     # 写回：锁内只做「读头校验 + 覆写」，绝不在锁内 await LLM
                     # （threading.Lock 在事件循环里等待 LLM 会阻塞整个 loop）
                     for _attempt in range(2):
-                        with self._get_reset_lock(group_id):
+                        async with self._async_reset_lock(group_id):
                             chunks = self.session_mgr.read_memory(sid) or []
                             cur_head = ""
                             if chunks and is_summary_chunk(chunks[0]):
@@ -1392,7 +1436,10 @@ class MergeEngine:
                                     chunks[0] = [summary_msg] + list(chunks[0])
                                 else:
                                     chunks = [[summary_msg]]
-                                self.session_mgr.write_memory(sid, chunks)
+                                # write_memory 是同步全量 JSON 落盘，挪到线程
+                                await asyncio.to_thread(
+                                    self.session_mgr.write_memory, sid, chunks
+                                )
                                 self._update_store_after_reset([sid], {sid: final})
                                 if self.logger:
                                     self.logger.info(
@@ -1473,8 +1520,10 @@ class MergeEngine:
         }
 
         # per-group 锁：与自动 hard 重开互斥（自动发生在 to_thread 的 _apply_sync 里）
-        with self._get_reset_lock(group_id):
-            results = hard_reset_members(
+        # 事件循环侧经 _async_reset_lock 获取；N×全量落盘整体挪到线程
+        async with self._async_reset_lock(group_id):
+            results = await asyncio.to_thread(
+                hard_reset_members,
                 self.session_mgr,
                 members,
                 keep,
@@ -1607,7 +1656,7 @@ class MergeEngine:
                             sid, dropped_map[sid], head_map.get(sid, ""), async_group_id
                         )
                     if final:
-                        self._write_summary_to_memory(sid, final, async_group_id)
+                        await self._write_summary_to_memory(sid, final, async_group_id)
                         self._preheat_pending.pop(sid, None)
                         if self.enable_summary_logging and self.logger:
                             self.logger.info("[摘要调试] async 收割并写入 %s 持续压缩摘要", sid)

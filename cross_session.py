@@ -16,12 +16,16 @@ from core.chat.message_elements import Text
 # 目标会话识别标记（写入 notice 正文）
 ROUTE_MARKER = "[merge_cross_session_request]"
 
+# 跨会话跳数上限：路由正文带 hop 计数，hop ≥ 上限时拒绝投递（防 A→B→A 乒乓，
+# 每跳都是一整轮 LLM 费用；去重 TTL 之外的最后防线）
+ROUTE_MAX_HOPS = 2
+
 # 源会话 tool_result / 交棒识别（勿改语义关键字，ON_STEP_RESULT 依赖）
 ROUTE_OK_PREFIX = "cross-session request routed to "
 ROUTE_DEDUP_PREFIX = "cross-session request already routed to this target recently"
 
 
-def build_route_notice_text(source_sid: str, description: str) -> str:
+def build_route_notice_text(source_sid: str, description: str, hop: int = 1) -> str:
     """构造投递到目标会话的跨会话请求正文（非对用户最终话术模板）。"""
     desc = (description or "").strip()
     if len(desc) > 1500:
@@ -31,6 +35,7 @@ def build_route_notice_text(source_sid: str, description: str) -> str:
     return (
         f"{ROUTE_MARKER}\n"
         f"source_session: {source_sid}\n"
+        f"hop: {max(1, int(hop or 1))}\n"
         f"{extra}"
         "你已切换到本会话。请结合合并后的对话上文，在本会话继续执行上文的任务。\n"
         "要求：\n"
@@ -42,6 +47,20 @@ def build_route_notice_text(source_sid: str, description: str) -> str:
 
 def is_merge_route_request_text(text: str) -> bool:
     return bool(text) and ROUTE_MARKER in text
+
+
+def route_hop_of_text(text: str) -> int:
+    """从路由正文解析 hop 计数；旧版无 hop 行的正文按 1 处理（向后兼容）。"""
+    if not text or ROUTE_MARKER not in text:
+        return 0
+    for line in str(text).splitlines()[1:6]:
+        line = line.strip()
+        if line.startswith("hop:"):
+            try:
+                return max(1, int(line[4:].strip()))
+            except (TypeError, ValueError):
+                return 1
+    return 1
 
 
 def is_route_handoff_result(text: str) -> bool:
@@ -244,11 +263,22 @@ async def route_cross_session_request(
     target: str,
     description: str,
     logger=None,
+    hop: int = 1,
 ) -> Tuple[bool, str]:
     """
     将跨会话请求路由到目标会话并激活 LLM。
     返回 (ok, tool_result_message)
     """
+    if hop >= ROUTE_MAX_HOPS:
+        if logger:
+            logger.warning(
+                "[MERGER] route rejected %s -> %s: hop=%d >= %d（跨会话乒乓保护）",
+                source_sid, target, hop, ROUTE_MAX_HOPS,
+            )
+        return False, (
+            "failed: cross-session hop limit reached; "
+            "answer in the current session instead of routing further."
+        )
     resolved, err = resolve_target_sid(ctx, target)
     if err:
         if logger:
@@ -275,7 +305,7 @@ async def route_cross_session_request(
         return False, perm_err
 
     try:
-        notice = build_route_notice_text(source_sid or "unknown", description)
+        notice = build_route_notice_text(source_sid or "unknown", description, hop=hop)
         await ctx.publish_notice(
             target,
             MessageChain([Text(notice)]),
