@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import re
@@ -39,6 +40,8 @@ class ObservePool:
         self._data: Dict[str, List[Dict[str, Any]]] = {}
         self._dirty = 0
         self._seen_ids: Dict[str, set] = {}
+        # 节流触发的异步落盘任务（避免 ON_IM_MESSAGE 链路同步写盘）
+        self._flush_task: "Optional[asyncio.Task]" = None
         self._load()
 
     def _path(self) -> Optional[Path]:
@@ -85,8 +88,11 @@ class ObservePool:
         if not path:
             return
         try:
+            # 先快照再序列化：flush 可能在 worker 线程执行，
+            # 与事件循环里的 add 并发时避免"遍历时字典变更"
+            snapshot = {sid: list(items) for sid, items in self._data.items()}
             path.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2),
+                json.dumps(snapshot, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             self._dirty = 0
@@ -149,8 +155,30 @@ class ObservePool:
         self._trim_sid(sid)
         self._dirty += 1
         if self._dirty >= self.flush_every:
-            self.flush()
+            self._schedule_flush()
         return True
+
+    def _schedule_flush(self):
+        """节流落盘：事件循环里把同步 JSON 写盘挪到 worker 线程。
+
+        已有任务在跑则不再重复调度（dirty 计数继续累积，下轮再触发）；
+        不在事件循环上下文（如极端兜底）退化为同步 flush。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.flush()
+            return
+        task = self._flush_task
+        if task is not None and not task.done():
+            return
+        self._flush_task = loop.create_task(self._flush_in_thread())
+
+    async def _flush_in_thread(self):
+        try:
+            await asyncio.to_thread(self.flush)
+        except Exception:
+            pass
 
     def sample_peek(
         self,

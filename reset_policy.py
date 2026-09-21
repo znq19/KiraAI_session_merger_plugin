@@ -61,12 +61,32 @@ class SoftResetState:
     才会更新 last_reset / 可能减半 keep。未超限时绝不减半。
     """
 
+    # 内存治理：长期运行下按 group 单调增长，超上限时惰性淘汰长期不活跃的组
+    _GC_MAX_ENTRIES = 512
+    _GC_MAX_AGE_SEC = 7 * 86400
+
     def __init__(self, keep_turns: int = 6, check_interval_sec: int = 60):
         self.default_keep = max(1, int(keep_turns or 6))
         self.check_interval = max(0, int(check_interval_sec or 0))
         self._dynamic_keep: Dict[str, int] = {}
         self._last_reset: Dict[str, float] = {}
         self._last_check: Dict[str, float] = {}
+
+    def _gc(self, now: float):
+        """惰性淘汰长期不活跃的组状态（仅超上限时触发；活跃组语义不变）。"""
+        if len(self._last_check) < self._GC_MAX_ENTRIES:
+            return
+        cutoff = now - self._GC_MAX_AGE_SEC
+        stale = {g for g, ts in self._last_check.items() if ts < cutoff}
+        stale |= {g for g, ts in self._last_reset.items() if ts < cutoff}
+        stale |= {
+            g for g in self._dynamic_keep
+            if g not in self._last_reset and g not in self._last_check
+        }
+        for g in stale:
+            self._dynamic_keep.pop(g, None)
+            self._last_reset.pop(g, None)
+            self._last_check.pop(g, None)
 
     def update_defaults(self, keep_turns: int, check_interval_sec: int):
         self.default_keep = max(1, int(keep_turns or 6))
@@ -81,6 +101,7 @@ class SoftResetState:
         if now - last < self.check_interval:
             return False
         self._last_check[group_id] = now
+        self._gc(now)
         return True
 
     def peek_should_check(self, group_id: str, now: Optional[float] = None) -> bool:

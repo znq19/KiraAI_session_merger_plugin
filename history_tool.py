@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import traceback
@@ -767,20 +768,30 @@ class HistoryToolService:
                 self._note_success()
                 return empty
 
-            # ---------- get_msg 批量刷新（最多 10 条/次） ----------
+            # ---------- get_msg 批量刷新（最多 10 条/次，并行） ----------
             if client is not None:
                 target = messages[-fetch_count:]
-                refreshed = 0
+                # 先收集待刷新 (下标, message_id)，再 gather 并行：
+                # 串行最坏 _MAX_REFRESH × 单次超时（10×15s），并行后 ≈ 单次超时
+                jobs = []
                 for i, m in enumerate(target):
-                    if refreshed >= _MAX_REFRESH:
+                    if len(jobs) >= _MAX_REFRESH:
                         break
                     if self._needs_refresh(m):
                         mid = m.get("message_id")
                         if mid is not None:
-                            fresh = await self._get_msg_ws(client, mid)
-                            if fresh and fresh.get("message"):
-                                target[i] = fresh
-                                refreshed += 1
+                            jobs.append((i, mid))
+                refreshed = 0
+                if jobs:
+                    results = await asyncio.gather(
+                        *(self._get_msg_ws(client, mid) for _, mid in jobs),
+                        return_exceptions=True,
+                    )
+                    # 按下标映射回原位置，保持消息顺序不变
+                    for (i, _mid), fresh in zip(jobs, results):
+                        if isinstance(fresh, dict) and fresh.get("message"):
+                            target[i] = fresh
+                            refreshed += 1
                 if refreshed and self.logger:
                     self.logger.info(
                         "[history_tool] refreshed %d messages via get_msg", refreshed

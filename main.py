@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from core.plugin import BasePlugin, logger, on, Priority, register
 from core.provider import LLMRequest
@@ -27,6 +27,7 @@ from .cross_session import (
     list_enabled_adapters,
     mark_event_handoff,
     route_cross_session_request,
+    route_hop_of_text,
 )
 from .group_agent_queue import GroupAgentQueue, resolve_settle_sec
 from .group_resolver import GroupResolver
@@ -183,13 +184,14 @@ class SessionMergerPlugin(BasePlugin):
         # compat
         self.auto_disable_ads = False
 
-        # 跨会话 session_send 去重：(source_sid, target) -> last_ts
-        self._session_send_dedup: Dict[Tuple[str, str], float] = {}
+        # 跨会话 session_send 去重：无向 frozenset({source, target}) -> last_ts
+        self._session_send_dedup: Dict[frozenset, float] = {}
         self.session_send_dedup_sec = 25
         self._session_send_wrapped = False
         # 包装版本：升级后强制重装，避免热重载残留「直达」旧包装
         # 9 = 同会话拒绝文案 + description/tip 收紧（当前会话直接 xml）
-        self._SESSION_SEND_WRAP_VERSION = 9
+        # 10 = 路由 hop 计数（≥2 拒投递，防乒乓）+ 无向去重键
+        self._SESSION_SEND_WRAP_VERSION = 10
 
 
 
@@ -770,6 +772,43 @@ class SessionMergerPlugin(BasePlugin):
     async def on_loaded(self, *_):
         """全部插件加载完后接管 session_send。"""
         self._ensure_session_send_wrap()
+        self._warn_group_lock_ttl()
+
+    def _warn_group_lock_ttl(self):
+        """组锁 TTL 必须 > 预期最长一轮 agent（含工具循环）。
+
+        TTL 强放锁后重放批次可能撞上仍在跑的一轮（并行轮，打破"组内单窗口"）。
+        这里只告警不改配置；建议 group_agent_lock_ttl_sec ≥ 600。
+        """
+        try:
+            if not self.enable_group_agent_queue:
+                return
+            ttl = float(self.group_agent_lock_ttl_sec or 180)
+            tool_to = 60.0
+            try:
+                tool_to = float(
+                    self.ctx.config.get_config("bot_config.agent.tool_call_timeout")
+                    or 60
+                )
+            except Exception:
+                pass
+            # LLM 单次超时在 provider 的模型配置里，尽力读取，失败按常见默认 120s
+            llm_to = 120.0
+            try:
+                client = self.ctx.provider_mgr.get_default_llm()
+                mc = getattr(getattr(client, "model", None), "model_config", None) or {}
+                llm_to = float(mc.get("timeout", 120) or 120)
+            except Exception:
+                pass
+            need = llm_to + tool_to
+            if ttl <= need:
+                logger.warning(
+                    "[MERGER] group_agent_lock_ttl_sec=%.0fs ≤ LLM超时(%.0fs)+工具超时(%.0fs)=%.0fs："
+                    "一轮 agent（含工具循环）可能跑不完就被 TTL 强放锁，建议调大到 ≥600s",
+                    ttl, llm_to, tool_to, need,
+                )
+        except Exception:
+            pass
 
     def _ensure_session_send_wrap(self):
         """可重复调用：合并启用时强制安装/升级 ROUTE 包装。"""
@@ -882,7 +921,18 @@ class SessionMergerPlugin(BasePlugin):
 
             ttl = float(getattr(plugin, "session_send_dedup_sec", 0) or 0)
             now = time.time()
-            key = (source, target)
+            # 无向去重键：A→B 与 B→A 同一对（防 TTL 窗口内来回乒乓）
+            key = frozenset({source, target})
+            # 跳数：本批次若是路由投递（含 ROUTE 标记），在其 hop 上 +1；
+            # hop ≥ 上限由 route_cross_session_request 拒绝投递
+            hop = 1
+            try:
+                blob = plugin._batch_text_blob(event)
+                prev_hop = route_hop_of_text(blob)
+                if prev_hop:
+                    hop = prev_hop + 1
+            except Exception:
+                hop = 1
             if ttl > 0:
                 expired = [
                     k for k, ts in plugin._session_send_dedup.items()
@@ -907,6 +957,7 @@ class SessionMergerPlugin(BasePlugin):
                 target=target,
                 description=description,
                 logger=logger,
+                hop=hop,
             )
             if ok:
                 mark_event_handoff(event, target)
@@ -1379,6 +1430,9 @@ class SessionMergerPlugin(BasePlugin):
         try:
             # 不改 buffer/flush/discard
             if event.is_mentioned:
+                return
+            # 前置插件（S/Z 等）已 discard 的消息（拉黑/抑制）不进观察池
+            if getattr(event, "process_strategy", "") == "discard":
                 return
             # 不把跨会话路由 / 系统 notice 记入观察池
             try:

@@ -142,7 +142,17 @@ class GroupAgentQueue:
             # 调度重发的 batch：已预授权
             if event_id and event_id in self._authorized_event_ids:
                 self._authorized_event_ids.discard(event_id)
-                if st.running and not self._expired(st, now):
+                # 区分「pop_next_and_begin 为本次重放预留的占位锁」
+                # （running 但 active_event_id 为空且 sid 匹配）与「别人占着的锁」：
+                # 占位锁应直接接管；误判为"锁仍被占"会重新入队 + stop，而
+                # watch 在"授权已消费"分支退出不放锁 → 幻影锁挂到 TTL（重放死锁）
+                placeholder = (
+                    st.running
+                    and not st.active_event_id
+                    and (not st.active_sid or st.active_sid == sid)
+                    and not self._expired(st, now)
+                )
+                if st.running and not placeholder and not self._expired(st, now):
                     # 异常：锁仍被占 → 重新入队
                     self._enqueue_locked(st, group_id, sid, event, now)
                     return False
@@ -281,6 +291,9 @@ class GroupAgentQueue:
             st.active_event_id = ""
             st.started_at = 0.0
             should_schedule = bool(st.queue)
+            # 内存治理：组已空闲（未运行且队列空）→ 删除状态，避免 _states 无界增长
+            if not should_schedule:
+                self._states.pop(group_id, None)
 
         if should_schedule and schedule_fn:
             await schedule_fn(group_id)
@@ -313,6 +326,9 @@ class GroupAgentQueue:
             st.active_event_id = ""
             st.started_at = 0.0
             should_schedule = bool(st.queue)
+            # 内存治理：组已空闲（未运行且队列空）→ 删除状态
+            if not should_schedule:
+                self._states.pop(group_id, None)
         if should_schedule and schedule_fn:
             await schedule_fn(group_id)
 
@@ -438,6 +454,8 @@ class GroupAgentQueue:
                                 pass
                     return
                 if time.time() >= deadline:
+                    # 兜底退出时一并丢弃授权，避免 _authorized_event_ids 无界增长
+                    self._authorized_event_ids.discard(eid)
                     return  # 未消费也未停：交回原有 TTL 兜底
         except asyncio.CancelledError:
             return
