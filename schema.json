@@ -107,7 +107,7 @@
         "hint": "超 token 上限后只保留最近这么多轮。连续超限会自动减半（最少 1 轮）。"
       },
       "merge_reset_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "超限处理模式",
         "options": [
           "soft",
@@ -215,7 +215,7 @@
         "hint": "自动去掉对不齐的工具调用/结果，减少模型重复乱调工具。"
       },
       "source_tag_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "来源标签样式",
         "options": [
           "prefix",
@@ -226,7 +226,7 @@
         "hint": "prefix：完整 [session: …] 标签；compact：短标签；none：不加来源前缀（容易串台）。"
       },
       "merge_order_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "合并排序模式",
         "options": [
           "session_blocks",
@@ -249,7 +249,7 @@
     "collapsed": false,
     "fields": {
       "merge_trigger_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "超限触发模式",
         "options": [
           "either",
@@ -456,7 +456,7 @@
         "hint": "旧摘要与新增量合并/自压缩的超时（秒）。超时退化为拼接，避免阻塞回复。"
       },
       "continuous_merge_strategy": {
-        "type": "enum",
+        "type": "string",
         "label": "持续压缩合并策略",
         "default": "append_then_merge",
         "options": [
@@ -510,7 +510,7 @@
         "name": "拼接摘要超长阈值（字符）"
       },
       "concat_overflow_strategy": {
-        "type": "enum",
+        "type": "string",
         "label": "拼接超长策略",
         "default": "self_compress",
         "options": [
