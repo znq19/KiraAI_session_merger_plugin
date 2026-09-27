@@ -174,6 +174,7 @@ class SessionMergerPlugin(BasePlugin):
         self.group_queue: Optional[GroupAgentQueue] = None
         self._memory_write_wrapped = False
         self._orig_update_memory = None
+        self._event_bus = None
         self._drain_tasks: Dict[str, asyncio.Task] = {}
 
         # debug
@@ -691,6 +692,7 @@ class SessionMergerPlugin(BasePlugin):
             concat_overflow_strategy=self.concat_overflow_strategy,
             debug=self.enable_debug_log,
             log_preview=self.log_merged_message_preview,
+            reset_command_enabled=self.enable_reset_summary_command,
             logger=logger,
         )
 
@@ -741,6 +743,17 @@ class SessionMergerPlugin(BasePlugin):
                 logger.warning("[session_merger] 按策略 disable_self：合并功能已停用")
         except Exception as e:
             logger.warning("[session_merger] CCS 冲突处理失败: %s", e)
+
+        # 会话生命周期事件：用户清空/删除会话时同步丢弃累计摘要与暂存，
+        # 防止旧摘要污染同一 sid 上的新会话（旧框架无此事件时自动跳过）
+        try:
+            bus = getattr(self.ctx, "event_bus", None)
+            if bus is not None:
+                bus.subscribe("session_memory_written", self._on_session_memory_written)
+                bus.subscribe("session_deleted", self._on_session_deleted)
+                self._event_bus = bus
+        except Exception as e:
+            logger.warning("[MERGER] 会话事件订阅失败（不影响主流程）: %s", e)
 
         logger.info(
             "会话合并初始化 enabled=%s mode=%s max_sessions=%d chunks=%d "
@@ -1057,6 +1070,14 @@ class SessionMergerPlugin(BasePlugin):
             logger.warning("[MERGER] settle 配置迁移写回失败（运行时已按 0 生效）: %s", e)
 
     async def terminate(self):
+        bus = self._event_bus
+        if bus is not None:
+            try:
+                bus.unsubscribe("session_memory_written", self._on_session_memory_written)
+                bus.unsubscribe("session_deleted", self._on_session_deleted)
+            except Exception:
+                pass
+            self._event_bus = None
         if self.observe_pool:
             try:
                 self.observe_pool.flush(force=True)
@@ -1142,6 +1163,29 @@ class SessionMergerPlugin(BasePlugin):
         except Exception:
             pass
         self._memory_write_wrapped = False
+
+    async def _on_session_memory_written(self, event):
+        """框架会话记忆被写入：写入为空（用户清空会话）时丢弃该会话的摘要状态。"""
+        payload = getattr(event, "payload", None) or {}
+        sid = payload.get("session")
+        if sid and not payload.get("new_memory"):
+            self._forget_session_state(sid)
+
+    async def _on_session_deleted(self, event):
+        """框架会话被删除：丢弃该会话的累计摘要与暂存。"""
+        payload = getattr(event, "payload", None) or {}
+        sid = payload.get("session")
+        if sid:
+            self._forget_session_state(sid)
+
+    def _forget_session_state(self, sid: str) -> None:
+        """同步清理某 sid 的累计摘要、预热暂存与后台任务。"""
+        if self.engine:
+            try:
+                self.engine.forget_session(sid)
+            except Exception:
+                pass
+        logger.info("[MERGER] session cleared/deleted: summary state dropped sid=%s", sid)
 
     async def _on_group_memory_written(self, sid: str, group_id: str):
         if not self.group_queue:
@@ -1658,6 +1702,12 @@ class SessionMergerPlugin(BasePlugin):
                 pass
             try:
                 self._session_send_dedup.clear()
+            except Exception:
+                pass
+            # 预热暂存/后台任务一并复位（防止旧谱系 pending 在清空后仍被收割）
+            try:
+                if self.engine:
+                    self.engine.cancel_summary_tasks()
             except Exception:
                 pass
             # 累计摘要存储一并清掉（防止旧摘要污染新会话）

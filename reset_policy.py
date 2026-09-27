@@ -111,12 +111,21 @@ class SoftResetState:
         now = now if now is not None else time.time()
         return (now - self._last_check.get(group_id, 0)) >= self.check_interval
 
-    def peek_reset_keep(self, group_id: str, now: Optional[float] = None) -> int:
-        """只读版 on_reset：返回「若此刻重开会用的 keep」，不改任何状态。"""
+    def peek_reset_keep(
+        self, group_id: str, now: Optional[float] = None, degrade: Optional[bool] = None
+    ) -> int:
+        """只读版 on_reset：返回「若此刻重开会用的 keep」，不改任何状态。
+
+        degrade 必须与 on_reset 使用同一信号（上次重开后仍超预算），
+        否则「预检生成摘要用的 keep」会与实际重开不一致，导致多丢弃的
+        轮次既未被保留也未被摘要。degrade=None 时退回旧时间窗语义（兼容）。
+        """
         now = now if now is not None else time.time()
-        last_reset = self._last_reset.get(group_id, 0)
-        half_window = self.check_interval / 2 if self.check_interval > 0 else 30.0
-        if last_reset and (now - last_reset) < half_window:
+        if degrade is None:
+            last_reset = self._last_reset.get(group_id, 0)
+            half_window = self.check_interval / 2 if self.check_interval > 0 else 30.0
+            degrade = bool(last_reset and (now - last_reset) < half_window)
+        if degrade:
             old = self._dynamic_keep.get(group_id, self.default_keep)
             return max(1, old // 2)
         return self.default_keep

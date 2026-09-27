@@ -27,10 +27,12 @@ from .reset_policy import (
 from .summarizer import (
     SUMMARY_MARKER,
     build_summary_chunk,
+    covered_anchor,
     dropped_fingerprint,
     extract_summary_text,
     is_summary_chunk,
     merge_summaries,
+    message_fingerprint,
     self_compress_summary,
     summarize_history,
 )
@@ -95,6 +97,7 @@ class MergeEngine:
         concat_overflow_strategy: str = "self_compress",
         debug: bool = False,
         log_preview: bool = False,
+        reset_command_enabled: bool = False,
         logger=None,
     ):
         self.session_mgr = session_mgr
@@ -187,7 +190,11 @@ class MergeEngine:
         self._still_over: Dict[str, bool] = {}
         # async 补写任务：sid -> Task
         self._summary_tasks: dict = {}
+        # 预热结果消费方之一：手动压缩重开命令是否启用（另一方是 hard 自动重开）
+        self.reset_command_enabled = bool(reset_command_enabled)
         # 持续后台压缩：sid -> Task / 结果暂存
+        # （暂存由事件循环与 to_thread 工作线程共同读写：GIL 下按引用原子操作，
+        #   跨线程写入以整体替换为主，避免就地复合修改）
         self._preheat_tasks: dict = {}
         self._preheat_pending: dict = {}
         # 后台合并/自压缩任务：sid -> Task
@@ -293,18 +300,17 @@ class MergeEngine:
         return False
 
     def _clamp_keep(self, keep: int) -> int:
-        """钳制：rounds 触发下 keep 必须 < 窗口，否则重开后下一次 append
-        会被框架抢先截掉融合头部（摘要丢失 + 前缀缓存逐轮失效）。"""
+        """钳制：keep 必须 < 框架窗口，否则重开后第一次 append 就会把
+        融合头部摘要截掉（摘要丢失 + 前缀缓存逐轮失效）。与触发模式无关，始终生效。"""
         keep = max(1, int(keep or 1))
-        if self.merge_trigger_mode in ("rounds", "either"):
-            cap = max(1, self._rounds_limit() - 1)
-            if keep > cap:
-                if self.logger:
-                    self.logger.warning(
-                        "[MERGER] keep=%d >= rounds 窗口 %d，钳制为 %d 防止框架截断头部摘要",
-                        keep, self._rounds_limit(), cap,
-                    )
-                keep = cap
+        cap = max(1, self._rounds_limit() - 1)
+        if keep > cap:
+            if self.logger:
+                self.logger.warning(
+                    "[MERGER] keep=%d >= 框架窗口 %d，钳制为 %d 防止框架截断头部摘要",
+                    keep, self._rounds_limit(), cap,
+                )
+            keep = cap
         return keep
 
     def should_merge(self, sid: str) -> bool:
@@ -391,6 +397,7 @@ class MergeEngine:
         current_sid: str,
         summary_chunks: Optional[dict] = None,
         out_info: Optional[dict] = None,
+        summary_texts: Optional[dict] = None,
     ) -> List[OpenAIMessage]:
         """
         流程：
@@ -480,6 +487,16 @@ class MergeEngine:
                         )
                     if out_info is not None:
                         out_info["hard_reset_sids"] = list(reset_members)
+                    # 线程内同步累计摘要存储：即使调用方超时（to_thread 不可取消），
+                    # 磁盘与 store 也保持一致（无摘要的成员清掉旧条目）
+                    if summary_texts is not None:
+                        try:
+                            self._update_store_after_reset(
+                                reset_members,
+                                {s: (summary_texts.get(s) or "") for s in reset_members},
+                            )
+                        except Exception:
+                            pass
                 msgs = self._build_raw_merged(current_sid, members)
             elif self.merge_reset_mode == "soft" and allow_reset:
                 self._log(
@@ -577,6 +594,7 @@ class MergeEngine:
         req: LLMRequest,
         summary_chunks: Optional[dict] = None,
         out_info: Optional[dict] = None,
+        summary_texts: Optional[dict] = None,
     ) -> bool:
         t0 = time.perf_counter()
         sid = getattr(event, "sid", None) or ""
@@ -584,7 +602,10 @@ class MergeEngine:
             return False
 
         merged = self.build_merged_history(
-            sid, summary_chunks=summary_chunks, out_info=out_info
+            sid,
+            summary_chunks=summary_chunks,
+            out_info=out_info,
+            summary_texts=summary_texts,
         )
 
         systems = []
@@ -661,9 +682,57 @@ class MergeEngine:
 
     # ── 持续后台压缩 ───────────────────────────────────────────────
 
+    @staticmethod
+    def _locate_anchor(msgs: List[dict], anchor: List[str]) -> int:
+        """定位旧覆盖终点在 msgs 中的下标；找不到返回 -1。
+
+        优先按"最后两条"指纹连续匹配（降低重复内容误配），
+        退化时按最后一条指纹匹配。
+        """
+        if not msgs or not anchor:
+            return -1
+        fps = [message_fingerprint(m) for m in msgs]
+        if len(anchor) >= 2:
+            for i in range(len(fps) - 2, -1, -1):
+                if fps[i] == anchor[0] and fps[i + 1] == anchor[1]:
+                    return i + 1
+        for i in range(len(fps) - 1, -1, -1):
+            if fps[i] == anchor[-1]:
+                return i
+        return -1
+
+    def _delta_after_anchor(
+        self, pend, dropped: List[dict], rest: Optional[List[dict]] = None
+    ) -> Tuple[List[dict], bool]:
+        """旧覆盖锚点之后、尚未覆盖的 dropped 部分（dropped 为记忆前缀）。
+
+        返回 (delta, covered)：
+        - covered=False：锚点已离开记忆/谱系异常 → 调用方按保守处理；
+        - 锚点位于 dropped 尾部之后（覆盖已越过 dropped）→ delta 为空；
+        - 提供 rest（含保留区的完整记忆）时能正确区分“覆盖越过 dropped”
+          与“锚点丢失”，未提供时仅按 dropped 定位。
+        """
+        anchor = (pend or {}).get("anchor") or []
+        if not anchor:
+            return list(dropped), False
+        msgs = rest if rest is not None else dropped
+        pos = self._locate_anchor(msgs, anchor)
+        if pos < 0:
+            return list(dropped), False
+        if pos >= len(dropped):
+            return [], True
+        return list(dropped[pos + 1:]), True
+
+    def _preheat_has_consumer(self) -> bool:
+        """预热结果的消费方：hard 模式自动重开 或 启用的手动压缩重开命令。"""
+        return self.merge_reset_mode == "hard" or self.reset_command_enabled
+
     def _should_compress_continuously(self, sid: str) -> bool:
         """当前会话是否已超过阈值，需要启动持续后台压缩。"""
         if self.preheat_ratio <= 0 or self.summarize_mode == "off" or not self.session_mgr:
+            return False
+        if not self._preheat_has_consumer():
+            # 无消费方（soft 且 /resum 未启用）时不启动预热，避免空转开销
             return False
         from .memory_access import safe_fetch_memory, safe_session_meta
 
@@ -693,6 +762,8 @@ class MergeEngine:
         """启动或维持后台持续压缩任务。"""
         if self.preheat_ratio <= 0 or self.summarize_mode == "off":
             return
+        if not self._preheat_has_consumer():
+            return
         task = self._preheat_tasks.get(sid)
         if task is not None and not task.done():
             return
@@ -715,6 +786,8 @@ class MergeEngine:
                 if not dropped:
                     self._preheat_pending.pop(sid, None)
                     return
+                # 完整记忆（含保留区）用于锚点定位：dropped 恒为其前缀
+                rest = [m for c in parts.get("chunks", []) for m in c]
                 group_id = self._group_id(sid)
                 base = self._resolve_base(sid, group_id, head_text)
                 eff = self._effective_dropped(head_text, dropped, base)
@@ -728,16 +801,20 @@ class MergeEngine:
                             self._schedule_background_merge(sid)
                     return
 
-                # 判断能否增量：base 一致且已压缩长度 < 当前 dropped 长度
+                # 判断能否增量：base 一致且旧覆盖锚点仍可定位。
+                # 锚点对齐（而非按长度切）保证框架原生窗口滑动时同样成立，
+                # 避免每轮全量重压缩整段历史。
                 is_incremental = False
                 prev_parts = []
                 delta_input = eff
                 if pending and (pending.get("base") or "") == (base or ""):
-                    prev_len = int(pending.get("compressed_len", 0))
-                    if 0 < prev_len < len(dropped):
+                    pos = self._locate_anchor(rest, pending.get("anchor") or [])
+                    if pos >= 0:
+                        if pos + 1 >= len(dropped):
+                            return  # 已覆盖到 dropped 尾部，无新增内容
                         is_incremental = True
                         prev_parts = list(pending.get("parts", []))
-                        delta_input = dropped[prev_len:]
+                        delta_input = dropped[pos + 1:]
 
                 delta = await summarize_history(
                     self.ctx,
@@ -790,6 +867,7 @@ class MergeEngine:
                     "final": final,
                     "base": base,
                     "compressed_len": len(dropped),
+                    "anchor": covered_anchor(dropped),
                     "parts": parts_list,
                     "background_tries": 0,
                 }
@@ -1069,35 +1147,51 @@ class MergeEngine:
         """
         timeout = timeout if timeout is not None else self.sync_wait_timeout
         task = self._preheat_tasks.get(sid)
-        if task is None:
-            return None
-        if not task.done():
-            if timeout <= 0:
-                return self._preheat_pending.get(sid)
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                # 超时只是调用方等不及：任务仍在跑，保留注册防止下次调度
-                # 再起一个同 sid 叠加（重复 LLM 费用）；任务完成后自行清理
-                return self._preheat_pending.get(sid)
-        # 任务已完成：仅当注册表仍指向它时才摘除（防误删后继任务）
-        if self._preheat_tasks.get(sid) is task:
-            self._preheat_tasks.pop(sid, None)
+        if task is not None:
+            if not task.done():
+                if timeout <= 0:
+                    return self._preheat_pending.get(sid)
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # 超时只是调用方等不及：任务仍在跑，保留注册防止下次调度
+                    # 再起一个同 sid 叠加（重复 LLM 费用）；任务完成后自行清理
+                    return self._preheat_pending.get(sid)
+            # 任务已完成：仅当注册表仍指向它时才摘除（防误删后继任务）
+            if self._preheat_tasks.get(sid) is task:
+                self._preheat_tasks.pop(sid, None)
+        # 任务已完成/已自摘时 pending 仍可能有效：不再因“无在跑任务”直接丢弃，
+        # 由调用方 _preheat_status 做谱系/锚点校验
         return self._preheat_pending.get(sid)
 
-    def _preheat_valid_final(
+    def _preheat_status(
         self, sid: str, dropped: List[dict], head_text: str, group_id: str
-    ) -> Optional[str]:
-        """校验 preheat_pending 是否与当前 dropped/base 匹配。"""
+    ) -> Tuple[Optional[str], Optional[List[dict]]]:
+        """校验 preheat_pending 是否可用，返回 (final, delta_dropped)。
+
+        - 谱系校验：pending.base 与当前 base 一致（store 未换代）才可用；
+        - 覆盖校验：按内容锚点定位旧覆盖终点，锚点之后、已进入 dropped 的
+          新增消息 = delta_dropped（仍需补写的部分）；锚点缺失时保守按
+          全量 dropped 处理（宁可多写一段，不可丢内容）。
+        返回 (None, None) 表示不可用。
+        """
         pending = self._preheat_pending.get(sid)
         if not pending:
-            return None
+            return None, None
+        final = pending.get("final")
+        if not final:
+            return None, None
         base = self._resolve_base(sid, group_id, head_text)
-        eff = self._effective_dropped(head_text, dropped, base)
-        fp = dropped_fingerprint(eff)
-        if pending.get("fp") == fp and (pending.get("base") or "") == (base or ""):
-            return pending.get("final")
-        return None
+        if (pending.get("base") or "") != (base or ""):
+            return None, None
+        delta, covered = self._delta_after_anchor(pending, dropped)
+        if not covered and self.enable_summary_logging and self.logger:
+            self.logger.info(
+                "[摘要调试] 收割 %s 锚点已离开当前 dropped，按全量 delta 保守补写", sid
+            )
+        return final, delta
 
     async def _harvest_for_group_sync(
         self,
@@ -1105,8 +1199,15 @@ class MergeEngine:
         group_id: str,
         head_map: Optional[dict] = None,
         timeout: Optional[float] = None,
-    ) -> Tuple[dict, dict]:
-        """sync 模式：并发收割各成员持续压缩结果；未就绪的成员：
+    ) -> Tuple[dict, dict, dict]:
+        """sync 模式：并发收割各成员持续压缩结果。
+
+        返回 (finals, missing, deltas)：
+        - finals：收割命中的摘要（sid -> 文本）；
+        - missing：未就绪成员（sid -> 全量 dropped），由调用方决定 sync/async 生成；
+        - deltas：收割命中但锚点后仍有新增的成员（sid -> 仅新增部分），
+          由调用方在重开后调度 async 补写（base=已写入的收割摘要）。
+        未就绪的成员：
         - immediate：fallback 现场生成（仍可能阻塞 LLM）
         - append_then_merge / append_only：不现场生成，由调用方调度 async/后台补写
         """
@@ -1119,15 +1220,19 @@ class MergeEngine:
         )
         finals: dict = {}
         missing: dict = {}
+        deltas: dict = {}
         for sid, raw in zip(sids, raw_results):
             if isinstance(raw, dict):
-                final = self._preheat_valid_final(
+                final, delta = self._preheat_status(
                     sid, dropped_map[sid], head_map.get(sid, ""), group_id
                 )
                 if final:
                     finals[sid] = final
-                    # append_then_merge 保留 pending 供后台继续合并拼接部分
-                    if self.continuous_merge_strategy == "append_then_merge":
+                    if delta:
+                        # 锚点之后仍有新增：调用方在重开后调度 async 补写
+                        deltas[sid] = delta
+                    elif self.continuous_merge_strategy == "append_then_merge":
+                        # append_then_merge 保留 pending 供后台继续合并拼接部分
                         pending = self._preheat_pending.get(sid)
                         parts = list(pending.get("parts", [])) if pending else []
                         if len(parts) > 1:
@@ -1135,7 +1240,11 @@ class MergeEngine:
                     else:
                         self._preheat_pending.pop(sid, None)
                     if self.enable_summary_logging and self.logger:
-                        self.logger.info("[摘要调试] sync 收割 %s 持续压缩摘要", sid)
+                        self.logger.info(
+                            "[摘要调试] sync 收割 %s 持续压缩摘要 (delta=%d)",
+                            sid,
+                            len(delta),
+                        )
                     continue
             missing[sid] = dropped_map[sid]
         if missing and self.continuous_merge_strategy == "immediate":
@@ -1143,7 +1252,7 @@ class MergeEngine:
                 missing, group_id, head_map, preprocess=self.preprocess_in_sync
             )
             finals.update(more)
-        return finals, missing
+        return finals, missing, deltas
 
     async def _write_summary_to_memory(self, sid: str, final: str, group_id: str):
         """将已生成的累计摘要写回会话记忆首部（带重开锁）。"""
@@ -1217,7 +1326,14 @@ class MergeEngine:
         )
         if not tokens_over and not self._members_rounds_over(members):
             return None
-        keep = self._soft_state.peek_reset_keep(group_id)
+        # 与 apply 侧 on_reset 使用同一降级信号，且同样套 keep 钳制，
+        # 保证「生成摘要的 keep」与「实际重开的 keep」一致（否则多丢弃的轮次
+        # 既未被保留也未被摘要）
+        keep = self._clamp_keep(
+            self._soft_state.peek_reset_keep(
+                group_id, degrade=self._still_over.get(group_id, False)
+            )
+        )
         dropped_map = {}
         head_map = {}
         for sid in members:
@@ -1232,10 +1348,28 @@ class MergeEngine:
 
     # ── 累计摘要辅助 ─────────────────────────────────────────
 
+    def _session_has_messages(self, sid: str) -> bool:
+        """会话除可能的摘要头外是否仍有其它消息（用于截断保活判定）。"""
+        try:
+            data = getattr(self.session_mgr, "chat_memory", None)
+            if not isinstance(data, dict) or sid not in data:
+                return False
+            mem = (data.get(sid) or {}).get("memory") or []
+            if not isinstance(mem, list) or not mem:
+                return False
+            if len(mem) > 1:
+                return True
+            first = mem[0]
+            return isinstance(first, list) and len(first) > 1
+        except Exception:
+            return True
+
     def _resolve_base(self, sid: str, group_id: str, head_text: str) -> str:
         """累计 base：store 与记忆头部对账；非累积模式仅降级窗口复用（旧语义）。"""
         if self.cumulative_summary and self.summary_store is not None:
-            return self.summary_store.sync_with_head(sid, head_text)
+            return self.summary_store.sync_with_head(
+                sid, head_text, session_has_messages=self._session_has_messages(sid)
+            )
         now = time.time()
         last_reset = self._soft_state._last_reset.get(group_id, 0)
         half_window = (
@@ -1483,6 +1617,23 @@ class MergeEngine:
         self._background_merge_tasks.clear()
         self._pending_replace.clear()
 
+    def forget_session(self, sid: str) -> None:
+        """会话被清空/删除：丢弃该 sid 的累计摘要与全部暂存/后台任务。"""
+        if not sid:
+            return
+        if self.summary_store is not None:
+            try:
+                self.summary_store.pop(sid)
+                self.summary_store.save()
+            except Exception:
+                pass
+        self._preheat_pending.pop(sid, None)
+        self._pending_replace.pop(sid, None)
+        for tasks in (self._summary_tasks, self._preheat_tasks, self._background_merge_tasks):
+            t = tasks.pop(sid, None)
+            if t is not None and not t.done():
+                t.cancel()
+
     async def manual_reset_with_summary(self, current_sid: str) -> dict:
         """
         压缩重开命令触发：立即对当前会话所在合并组执行「累计摘要 + 硬重开」。
@@ -1505,10 +1656,11 @@ class MergeEngine:
 
         finals: dict = {}
         missing: dict = {}
+        deltas: dict = {}
         if self.summarize_mode != "off" and dropped_map:
             try:
                 # 手动命令也尝试收割后台持续压缩，未就绪再现场生成
-                finals, missing = await self._harvest_for_group_sync(
+                finals, missing, deltas = await self._harvest_for_group_sync(
                     dropped_map, group_id, head_map, timeout=self.sync_wait_timeout
                 )
             except Exception:
@@ -1537,14 +1689,24 @@ class MergeEngine:
         # 累计摘要落盘（无摘要的成员清掉旧条目，防止旧摘要污染）
         self._update_store_after_reset(members, finals)
 
-        # append 策略下未就绪成员走 async 补写，避免手动命令也阻塞 LLM
+        # 未覆盖部分走 async 补写（避免手动命令也阻塞 LLM）：
+        # - missing（append 策略未就绪）→ 全量 dropped 补写
+        # - deltas（收割命中但锚点后仍有新增）→ 只补新增部分（base=收割摘要）
+        async_map: dict = {}
+        async_heads = dict(head_map)
         if missing and self.continuous_merge_strategy in ("append_then_merge", "append_only"):
             if self.logger:
                 self.logger.info(
                     "[MERGER summary] manual reset: append 策略未就绪，调度 async 补写 %s",
                     list(missing.keys()),
                 )
-            self._schedule_async_summaries(missing, group_id, head_map)
+            async_map.update(missing)
+        for _sid, _delta in deltas.items():
+            if _delta:
+                async_map[_sid] = _delta
+                async_heads[_sid] = finals.get(_sid, "")
+        if async_map:
+            self._schedule_async_summaries(async_map, group_id, async_heads)
 
         # 手动重开后：清除组级动态 keep，记录重开时间（节流自动重开）
         try:
@@ -1572,6 +1734,7 @@ class MergeEngine:
         summary_chunks: Optional[dict] = None
         sync_finals: dict = {}
         sync_missing: dict = {}
+        sync_deltas: dict = {}
         pending_async: Optional[tuple] = None  # (group_id, dropped_map, head_map)
         current_sid = getattr(event, "sid", None) or ""
         group_id = ""
@@ -1589,7 +1752,7 @@ class MergeEngine:
                         if self.enable_summary_logging and self.logger:
                             self.logger.info("[摘要调试] 进入 sync 模式，尝试收割持续压缩 / append 策略 fallback 走 async")
                         # sync 关键路径默认不做预处理（preprocess_in_sync，避免阻塞）
-                        sync_finals, sync_missing = await self._harvest_for_group_sync(
+                        sync_finals, sync_missing, sync_deltas = await self._harvest_for_group_sync(
                             pre["dropped_map"], group_id, head_map,
                             timeout=self.sync_wait_timeout,
                         )
@@ -1616,7 +1779,7 @@ class MergeEngine:
         try:
             ok = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._apply_sync, event, req, summary_chunks, out_info
+                    self._apply_sync, event, req, summary_chunks, out_info, sync_finals
                 ),
                 timeout=self._merge_timeout(),
             )
@@ -1646,26 +1809,40 @@ class MergeEngine:
                 self.logger.info("[摘要调试] async 模式实际重开的 sid: %s", list(reset_sids))
             if reset_sids:
                 to_schedule: dict = {}
+                delta_schedule: dict = {}
+                delta_heads: dict = {}
                 for sid in reset_sids:
                     if sid not in dropped_map:
                         continue
                     pending = await self._harvest_continuous_compression(sid, timeout=0)
                     final = None
+                    delta = None
                     if isinstance(pending, dict):
-                        final = self._preheat_valid_final(
+                        final, delta = self._preheat_status(
                             sid, dropped_map[sid], head_map.get(sid, ""), async_group_id
                         )
                     if final:
                         await self._write_summary_to_memory(sid, final, async_group_id)
                         self._preheat_pending.pop(sid, None)
+                        if delta:
+                            delta_schedule[sid] = delta
+                            delta_heads[sid] = final
                         if self.enable_summary_logging and self.logger:
-                            self.logger.info("[摘要调试] async 收割并写入 %s 持续压缩摘要", sid)
+                            self.logger.info(
+                                "[摘要调试] async 收割并写入 %s 持续压缩摘要 (delta=%d)",
+                                sid,
+                                len(delta or []),
+                            )
                     else:
                         to_schedule[sid] = dropped_map[sid]
                 if to_schedule:
                     if self.enable_summary_logging and self.logger:
                         self.logger.info("[摘要调试] 调度后台摘要任务: %s", list(to_schedule.keys()))
                     self._schedule_async_summaries(to_schedule, async_group_id, head_map)
+                if delta_schedule:
+                    if self.enable_summary_logging and self.logger:
+                        self.logger.info("[摘要调试] 收割后补写 delta: %s", list(delta_schedule.keys()))
+                    self._schedule_async_summaries(delta_schedule, async_group_id, delta_heads)
 
         # sync 模式下 append 策略未就绪的成员，也走 async 补写，避免请求路径阻塞
         if sync_missing and self.continuous_merge_strategy in ("append_then_merge", "append_only"):
@@ -1675,4 +1852,15 @@ class MergeEngine:
             if async_sids:
                 async_map = {s: sync_missing[s] for s in async_sids}
                 self._schedule_async_summaries(async_map, group_id, head_map)
+        # 收割命中但锚点后仍有新增的成员：只补差量（base=已写入的收割摘要）
+        if sync_deltas:
+            delta_sids = set(sync_deltas.keys()) & reset_sids
+            delta_map = {s: sync_deltas[s] for s in delta_sids if sync_deltas[s]}
+            if delta_map:
+                delta_heads = dict(head_map)
+                for _s in delta_map:
+                    delta_heads[_s] = sync_finals.get(_s, "")
+                if self.enable_summary_logging and self.logger:
+                    self.logger.info("[摘要调试] sync 收割后补写 delta: %s", list(delta_map.keys()))
+                self._schedule_async_summaries(delta_map, group_id, delta_heads)
         return ok
