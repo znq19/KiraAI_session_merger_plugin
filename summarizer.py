@@ -115,6 +115,38 @@ def dropped_fingerprint(dropped_flat: List[dict]) -> str:
     return f"{len(dropped_flat)}:{h}"
 
 
+def message_fingerprint(msg) -> str:
+    """单条消息的内容指纹（role + 文本前 200 字符），用于锚点对齐。"""
+    if not isinstance(msg, dict):
+        return ""
+    role = str(msg.get("role") or "")
+    content = msg.get("content")
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(str(p.get("text") or ""))
+        text = "".join(parts)
+    else:
+        text = str(content or "")
+    h = hashlib.sha256(f"{role}|{text[:200]}".encode("utf-8")).hexdigest()[:10]
+    return f"{role}:{h}"
+
+
+def covered_anchor(msgs: List[dict]) -> list:
+    """已覆盖范围的尾部锚点：最后两条消息的指纹（不足两条时单条）。
+
+    锚点用于对齐增量压缩与重开收割：窗口滑动（框架原生截断）后，
+    先按锚点在当前记忆中定位"旧覆盖终点"，其后才是未覆盖的新增部分。
+    """
+    fps = [message_fingerprint(m) for m in (msgs or []) if message_fingerprint(m)]
+    if not fps:
+        return []
+    if len(fps) >= 2:
+        return [fps[-2], fps[-1]]
+    return [fps[-1]]
+
+
 class CumulativeSummaryStore:
     """每会话累计摘要的持久化存储（插件数据目录 JSON）。
 
@@ -158,12 +190,17 @@ class CumulativeSummaryStore:
         self._ensure_loaded()
         self._data.pop(sid, None)
 
-    def sync_with_head(self, sid: str, head_summary: str) -> str:
+    def sync_with_head(
+        self, sid: str, head_summary: str, session_has_messages: bool = True
+    ) -> str:
         """以记忆头部摘要为准对账，返回权威累计摘要。
 
         - 头部摘要与 store 一致 → 用 store（正常路径）；
         - 头部存在但与 store 不一致（外部改动）→ 采用头部版本并回写 store；
-        - 头部不存在（用户清了会话 / 摘要丢失）→ 清掉 store 条目，返回空。
+        - 头部不存在：
+            · 会话仍在继续（还有其它消息）→ 摘要头大概率被框架原生截断，
+              保留 store 作为权威累计摘要（累计信息不丢，下次重开合并后写回记忆）；
+            · 会话已空（用户清了会话 / 会话被删）→ 清掉 store 条目，返回空。
         """
         self._ensure_loaded()
         stored = self.get(sid)
@@ -172,9 +209,10 @@ class CumulativeSummaryStore:
             if stored != head_summary:
                 self.set(sid, head_summary)
             return head_summary
-        if stored:
+        if stored and not session_has_messages:
             self.pop(sid)
-        return ""
+            return ""
+        return stored or ""
 
     def save(self) -> None:
         self._ensure_loaded()
