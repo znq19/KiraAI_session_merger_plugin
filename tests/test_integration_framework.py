@@ -12,6 +12,7 @@
   P  预热门控：无消费方（soft 且 /resum 关）时不启动
   T  apply 超时后线程仍完成 hard reset，且 store 与磁盘保持一致（线程内同步）
   R  手动压缩重开（/resum 路径）回归；precheck 谱系校验单元
+  PP 摘要预处理并发化：有界并发 ≤3 / 保序 / 失败回落 / 零待处理快路径
 
 Run:
   python3 tests/test_integration_framework.py
@@ -489,6 +490,65 @@ def main():
         parts_r = me.read_reset_parts(sess, sid_r, eng_r.merge_keep_turns)
         f_bad, d_bad = eng_r._preheat_status(sid_r, parts_r["dropped"], parts_r["head_text"], eng_r._group_id(sid_r))
         check("R2 谱系不一致的 pending 被拒绝", f_bad is None and d_bad is None)
+
+        # PP：摘要预处理并发化（有界并发 / 保序 / 失败回落）
+        prep_mod = importlib.import_module("plugins.ksm_it.preprocessor")
+
+        class _PreprocessProbe:
+            def __init__(self):
+                self.inflight = 0
+                self.max_inflight = 0
+                self.calls = 0
+
+            async def chat(self, request, **kwargs):
+                self.inflight += 1
+                self.calls += 1
+                if self.inflight > self.max_inflight:
+                    self.max_inflight = self.inflight
+                try:
+                    await asyncio.sleep(0.08)
+                    prompt = ""
+                    for m in request.messages:
+                        c = getattr(m, "content", "")
+                        if isinstance(c, str):
+                            prompt = c
+                    if "FAILME" in prompt:
+                        raise RuntimeError("probe fail")
+                    from core.provider.llm_model import LLMResponse
+                    return LLMResponse("PSUM")
+                finally:
+                    self.inflight -= 1
+
+        probe = _PreprocessProbe()
+        long_text = "alpha beta gamma " * 120
+        msgs_pp = [
+            {"role": "tool", "content": "[T1] " + long_text},
+            {"role": "user", "content": "普通用户消息"},
+            {"role": "tool", "content": "[T2] " + long_text},
+            {"role": "tool", "content": "[T3] FAILME " + long_text},
+            {"role": "user", "content": "另一个普通用户消息"},
+            {"role": "tool", "content": "[T4] " + long_text},
+            {"role": "tool", "content": "[T5] " + long_text},
+        ]
+        orig_first = msgs_pp[0]["content"]
+        out_pp = await prep_mod.preprocess_messages_for_summary(msgs_pp, 200, probe, logger)
+        check("PP1★ 预处理有界并发（2..3 且确有并行）", 2 <= probe.max_inflight <= 3, f"max={probe.max_inflight}")
+        check("PP2 调用次数=待处理条数（含失败项）", probe.calls == 5, f"calls={probe.calls}")
+        check("PP3 未处理项原样保留且顺序不变",
+              out_pp[1] is msgs_pp[1] and out_pp[4] is msgs_pp[4] and len(out_pp) == len(msgs_pp))
+        check("PP4 失败项回落原文", out_pp[3] is msgs_pp[3])
+        check("PP5 处理后项为副本且带压缩后缀",
+              out_pp[0] is not msgs_pp[0] and str(out_pp[0].get("content", "")).endswith("（已压缩）")
+              and str(out_pp[6].get("content", "")).endswith("（已压缩）"))
+        check("PP6 原消息未被改动", msgs_pp[0]["content"] == orig_first)
+
+        probe2 = _PreprocessProbe()
+        out_pp2 = await prep_mod.preprocess_messages_for_summary(
+            [{"role": "user", "content": "短消息"}, {"role": "tool", "content": "short"}],
+            200, probe2, logger,
+        )
+        check("PP7 零待处理快路径（不调用 LLM、原样返回）",
+              probe2.calls == 0 and out_pp2[0]["content"] == "短消息" and out_pp2[1]["content"] == "short")
 
         # E4：/reboota 复位引擎暂存（P1 新增接线）——放在最后（会清空测试会话）
         sid_z = "adz:dm:rz"
