@@ -1904,6 +1904,20 @@ class SessionMergerPlugin(BasePlugin):
                     getattr(event, "sid", ""),
                     ok,
                 )
+                # 观测性提示：路由目标是 QQ 官方适配器时，本轮由合成控制消息触发，
+                # 没有新鲜 msg_id —— 被动回复窗口（5 分钟）可能已过期，发送若报
+                # 40034005「msg_id已过期」属预期路径，由 fullmsg-bridge（v1.2.0+）
+                # 的主动消息兜底接管；未装 bridge 时该消息会丢失，这里提前点破。
+                try:
+                    adapter = getattr(event, "adapter", None)
+                    if adapter is not None and hasattr(adapter, "_group_reply_ids"):
+                        logger.info(
+                            "[MERGER] 目标会话走 QQ 官方适配器：本轮由跨会话控制消息触发，"
+                            "被动 msg_id 可能已过期；发送失败时请确认已装 "
+                            "KiraAI-qqbot-fullmsg-bridge-plugin（v1.2.0+，主动消息兜底默认开）"
+                        )
+                except Exception:
+                    pass
             except Exception:
                 logger.exception("[MERGER] route execute failed")
             return
