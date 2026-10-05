@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.8.4** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
+**版本 2.8.5** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -370,6 +370,14 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.8.5
+
+- **🟢 观测性：跨会话路由到 QQ 官方会话时打被动窗口提示**
+  - ROUTE 在目标会话执行时，若目标是 QQ 官方适配器（结构性识别 `_group_reply_ids`），
+    打一条 INFO 提示：本轮由合成控制消息触发、没有新鲜 msg_id，被动回复窗口（5 分钟）
+    可能已过期，发送若报 40034005「msg_id已过期」需 fullmsg-bridge（v1.2.0+）的
+    主动消息兜底接管。纯日志改动，不改变任何合并/路由行为。
 
 ### 2.8.4
 
