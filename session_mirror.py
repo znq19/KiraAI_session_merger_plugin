@@ -152,13 +152,14 @@ async def wait_framework_write_lock(sm) -> None:
             pass
 
 
-async def sm_write_chunks(sm, sid: str, chunks) -> None:
+async def sm_write_chunks(sm, sid: str, chunks, *, wait: bool = True) -> None:
     """整体覆写会话内容（保留标题/描述/能力设置等元数据）。
 
     2.x 保持原有的「同步全量 JSON 落盘挪到线程」语义；3.0 走原生异步 upsert。
     写完同步失效镜像。
     """
-    await wait_framework_write_lock(sm)
+    if wait:
+        await wait_framework_write_lock(sm)
     if hasattr(sm, "write_memory"):
         await asyncio.to_thread(sm.write_memory, sid, chunks)
         return

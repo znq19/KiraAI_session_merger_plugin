@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.9.2** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
+**版本 2.9.3** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -374,6 +374,13 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.9.3
+
+- **摘要写回改为「等框架写锁 → 重读 → 头部校验 → 写回」**：修复后台摘要替换的旧快照覆盖问题。此前是「读 → 等锁 → 写旧快照」，框架在等待期间 append 的回合会被吞掉（实测 6 chunks → 5，`MEANWHILE` 丢失）；现在读发生在等锁之后，append 会被包含。
+- **计数补齐**：`count_messages_tokens` 补 `reasoning_content`，多模态 list 只取 `text` 部分（不再 `str(list)`）。
+- 新增独立回归 `tests/test_safe_summary_write.py`（安全写回 + 头部校验 + 计数）。
+- 全量测试（新增 7/7）通过。
 
 ### 2.9.2
 

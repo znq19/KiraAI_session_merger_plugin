@@ -1,9 +1,9 @@
 {
   "plugin_id": "kira_session_merger",
   "display_name": "KSM·会话合并与互通",
-  "version": "2.9.2",
+  "version": "2.9.3",
   "author": "znq19",
-  "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.9.2：保留 ADS 请求级摘要桥、摘要不加来源前缀、rounds/keep 按真实窗口钳制、后台写回等框架写锁、镜像请求级对账。",
+  "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.9.3：摘要写回改为等框架写锁后重读（并发 append 不丢），计数补齐 reasoning/多模态 text。",
   "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
   "core_version": ">=2.29.6",
   "tags": [

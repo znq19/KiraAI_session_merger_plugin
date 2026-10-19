@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -15,13 +16,23 @@ def count_messages_tokens(messages: List[OpenAIMessage], chars_per_token: float 
             text = ""
         elif isinstance(content, str):
             text = content
+        elif isinstance(content, list):
+            # 多模态：只取 text 部分，避免 str(list) 混入结构字符
+            text = "".join(
+                str(p.get("text") or "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
         else:
             text = str(content)
         total += max(1, int(len(text) / cpt) + 1) if text else 0
         total += 4
         tcs = getattr(m, "tool_calls", None) or []
         if tcs:
-            total += max(1, int(len(str(tcs)) / cpt) + 1)
+            total += max(1, int(len(json.dumps(tcs, ensure_ascii=False)) / cpt) + 1)
+        rc = getattr(m, "reasoning_content", "") or ""
+        if rc:
+            total += max(1, int(len(str(rc)) / cpt) + 1)
     return total
 
 
