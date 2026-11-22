@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.9.3** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
+**版本 2.9.4** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -374,6 +374,14 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.9.4
+
+- **来源字段改为「齐全才算已有」**：群聊必须有 `group_name` / `group_id` / `user_nickname` / `user_id`，私聊必须有 `user_nickname` / `user_id`；只看到昵称不再当作完整头部（否则 S 定时任务首拉的历史会漏群名）。缺哪个补哪个：群名/群号从会话标题与 sid 补，私聊昵称/QQ 从标题与 sid 补。
+- **偷看补齐发言人身份**：观察池新增 `sender_card`（3.3.0 的 `group_nickname`）；prefix 模式输出完整 `[group_name: G group_id: GID user_nickname: N, group_nickname: C, user_id: U]` + 时间，私聊输出 `user_nickname` + `user_id`。修掉「群名缺失时把发言人名字当群名」的误标。compact 改为 `[gm:GID|群名|昵称|QQ]`，旧 observe.json 无 `sender_card` 自动回落。名字/群名含 `[` / `]` 时方括号与 `|` 转全角，防止伪造消息头。
+- **`message_types` 清洁**：组队列优先读 `supported_elements`，只有 2.x 没有该字段时才读 deprecated 的 `message_types`，不再每批触发弃用告警。
+- notice 行（戳一戳/禁言等）只按 `group_id` / `user_id` 判定，不再重复套群名/昵称，避免通知变噪音。
+- 新增 `tests/test_source_identity.py` 17 项；全量 316 项通过（29/15/32/110/70/26/10/7/17）。
 
 ### 2.9.3
 

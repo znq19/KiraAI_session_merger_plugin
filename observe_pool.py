@@ -10,6 +10,14 @@ from typing import Any, Dict, List, Optional
 
 from .timeout_utils import is_expired, session_type_of
 
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角，防止伪造消息头。"""
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
+
+
 
 class ObservePool:
     """
@@ -131,6 +139,7 @@ class ObservePool:
         sender_id: str = "",
         sender_name: str = "",
         group_name: str = "",
+        sender_card: str = "",
     ) -> bool:
         if not sid or not (content or "").strip():
             return False
@@ -146,8 +155,10 @@ class ObservePool:
             "message_id": mid,
             "timestamp": int(timestamp or time.time()),
             "sender_id": str(sender_id or ""),
-            "sender_name": str(sender_name or ""),
-            "group_name": str(group_name or ""),
+            # 显示名统一压单行：群名片/昵称里的换行不能伪造新的状态行。
+            "sender_name": _safe_display_name(sender_name),
+            "sender_card": _safe_display_name(sender_card),
+            "group_name": _safe_display_name(group_name),
             "content": content.strip(),
         }
         bucket = self._data.setdefault(sid, [])
@@ -223,90 +234,98 @@ class ObservePool:
         return out
 
     @staticmethod
-    def _content_already_has_source(content: str) -> bool:
-        """与 timeline 一致：正文已含官方身份字段则不再堆群名/昵称。"""
-        if not content:
-            return False
-        head = content[:240]
-        return (
-            "group_name:" in head
-            or "group_id:" in head
-            or "user_nickname:" in head
-            or "user_id:" in head
-            or head.startswith("[source_sid:")
-            or head.startswith("[session:")
-        )
+    def _has_session_prefix(content: str) -> bool:
+        """只认真正的会话前缀：正文里恰好出现 user_nickname: 不算（用户可能自己打）。"""
+        head = (content or "")[:120]
+        return head.startswith("[source_sid:") or head.startswith("[session:")
 
-    def _format_source_prefix_like_timeline(
+    def _format_peek_prefix(
         self,
         sid: str,
         mode: str,
-        content: str,
         group_name: str,
         sender_name: str,
+        sender_card: str,
+        sender_id: str,
+        timestamp: int,
     ) -> str:
-        """
-        对齐 timeline._format_source_prefix（user 角色最新规则）：
-        - prefix: [session: sid] [group_name/user_nickname|chat_type]
-        - compact: [st:entity|title]
-        - none: 空
-        已有官方字段时只补短 [session: sid]。
-        """
+        """偷看来源标签：prefix 与官方消息头同口径（群名/群号/昵称/群名片/QQ 号）。"""
         if mode == "none" or not sid:
             return ""
-
+        # 旧 observe.json 可能没有 sender_card，也可能带换行：渲染前再压一次单行。
+        group_name = _safe_display_name(group_name)
+        sender_name = _safe_display_name(sender_name)
+        sender_card = _safe_display_name(sender_card)
         parts = sid.split(":", 2)
         st = parts[1] if len(parts) >= 2 else ""
         entity = parts[2] if len(parts) >= 3 else sid
-        # 观察池有群名/发送者时优先；否则无 title（与 timeline 无标题时走 chat_type）
-        title = group_name or sender_name or ""
-
-        if self._content_already_has_source(content):
-            if sid in content[:120]:
-                return ""
-            if mode == "compact":
-                return f"[{st}:{entity}] " if st else f"[{sid}] "
-            return f"[session: {sid}] "
+        name = sender_name or "未知"
+        card = sender_card if sender_card and sender_card != name else ""
+        uid = str(sender_id or "").strip()
+        if not uid and st == "dm":
+            uid = entity
+        uid = uid or "未知"
+        try:
+            ts = int(timestamp or time.time())
+        except (TypeError, ValueError):
+            ts = int(time.time())
+        try:
+            date_str = time.strftime("%b %d %Y %H:%M %a", time.localtime(ts))
+        except (ValueError, OverflowError, OSError):
+            date_str = "未知时间"
 
         if mode == "compact":
-            if title:
-                return f"[{st}:{entity}|{title}] " if st else f"[{sid}|{title}] "
-            return f"[{st}:{entity}] " if st else f"[{sid}] "
+            if st == "gm":
+                bits = [f"{st}:{entity}", group_name or "-", name, uid]
+                return "[" + "|".join(bits) + "] "
+            if st == "dm":
+                bits = [f"{st}:{entity}", name]
+                return "[" + "|".join(bits) + "] "
+            return f"[{sid}] "
 
-        # prefix：与 timeline 相同分支
+        # prefix：完整身份，与 kira-ai 的群/私聊消息头一致
         if st == "gm":
-            if title:
-                return f"[session: {sid}] [group_name: {title}] "
-            return f"[session: {sid}] [chat_type: group] "
-        if st == "dm":
-            if title:
-                return f"[session: {sid}] [user_nickname: {title}] "
-            return f"[session: {sid}] [chat_type: private] "
-        if title:
-            return f"[session: {sid}] [title: {title}] "
-        return f"[session: {sid}] "
+            identity = (
+                f"group_name: {group_name or '未知'} group_id: {entity} "
+                f"user_nickname: {name}"
+            )
+            if card:
+                identity += f", group_nickname: {card}"
+            identity += f", user_id: {uid}"
+        elif st == "dm":
+            identity = f"user_nickname: {name}, user_id: {uid}"
+        else:
+            identity = f"title: {group_name or name}"
+        return f"[session: {sid}] [{date_str}] [{identity}] "
 
     def _format_peek_content(self, it: Dict[str, Any], mode: str) -> str:
         """
-        偷看注入文案 = 与合并时间线一致的来源前缀 + peek 标记 + 原文。
+        偷看注入文案 = 与官方消息头同口径的来源标签 + peek 标记 + 原文。
         peek 标记仅偷看需要，正式合并历史没有。
         """
         sid = str(it.get("sid") or "")
         content = str(it.get("content") or "").strip()
         if not content:
             return ""
-        group_name = str(it.get("group_name") or "").strip()
-        sender_name = str(it.get("sender_name") or "").strip()
-
-        # 已带 peek 标记：不再外包（避免双重）
         if "[msg_type: peek]" in content[:120]:
             return content
 
-        source = self._format_source_prefix_like_timeline(
-            sid, mode or "prefix", content, group_name, sender_name
-        )
+        prefix = ""
+        if self._has_session_prefix(content):
+            if sid not in content[:120]:
+                prefix = f"[session: {sid}] "
+        else:
+            prefix = self._format_peek_prefix(
+                sid,
+                mode or "prefix",
+                str(it.get("group_name") or "").strip(),
+                str(it.get("sender_name") or "").strip(),
+                str(it.get("sender_card") or "").strip(),
+                str(it.get("sender_id") or "").strip(),
+                it.get("timestamp") or 0,
+            )
         peek_tag = "[msg_type: peek] [not_addressed_to_you] "
-        return f"{source}{peek_tag}{content}"
+        return f"{prefix}{peek_tag}{content}"
 
     def stats(self) -> Dict[str, Any]:
         return {
