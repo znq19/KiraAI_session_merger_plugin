@@ -235,12 +235,17 @@ class GroupAgentQueue:
                 group_id,
             )
 
+        # 3.x 用 supported_elements；只有 2.x 没有该字段时才读 deprecated 的
+        # message_types（直接读旧属性会每次触发 DeprecationWarning）。
+        elements = getattr(event, "supported_elements", None)
+        if elements is None:
+            elements = getattr(event, "message_types", None)
         pending = PendingBatch(
             sid=sid,
             messages=messages,
             adapter=getattr(event, "adapter", None),
             session=getattr(event, "session", None),
-            message_types=list(getattr(event, "message_types", None) or []),
+            message_types=list(elements or []),
             enqueued_at=now,
         )
         st.queue.append(pending)

@@ -9,6 +9,14 @@ from core.agent.message import OpenAIMessage
 from .memory_access import safe_fetch_memory, safe_session_meta
 from .summarizer import SUMMARY_MARKER
 
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角，防止伪造消息头。"""
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
+
+
 
 @dataclass
 class TimelineMessage:
@@ -352,35 +360,45 @@ class TimelineBuilder:
         return title
 
 
-    def _content_already_has_source(self, content: str) -> bool:
-        """官方 user message_str 已含 group_name / user_nickname 等，避免重复堆叠。"""
+    _SOURCE_FIELDS_GM = ("group_name:", "group_id:", "user_nickname:", "user_id:")
+    _SOURCE_FIELDS_DM = ("user_nickname:", "user_id:")
+
+    def _content_already_has_source(self, content: str, session_type: str = "") -> bool:
+        """内容是否已经带齐官方来源字段。
+
+        3.3.0 的官方群消息头是
+        `group_name: … group_id: … user_nickname: …, [group_nickname: …,] user_id: …`。
+        只看到昵称不算齐（例如 S 定时任务首拉的历史），否则会漏掉群名/群号；
+        缺哪个由 _format_source_prefix 补哪个。group_nickname 没有群名片时本来就不出现，
+        所以不计入必需字段。
+        """
         if not content:
             return False
         head = content[:240]
-        return (
-            "group_name:" in head
-            or "group_id:" in head
-            or "user_nickname:" in head
-            or "user_id:" in head
-            or head.startswith("[source_sid:")
-            or head.startswith("[session:")
-        )
+        if head.startswith(("[source_sid:", "[session:")):
+            return True
+        # 官方 notice 行本来就没有昵称/群名（只有 id），不能按普通消息头要求，
+        # 否则会给每条戳一戳/禁言通知重复套一层群名/QQ 号。
+        if "Notice [" in head:
+            return ("group_id:" in head) if session_type == "gm" else ("user_id:" in head)
+        required = self._SOURCE_FIELDS_DM if session_type == "dm" else self._SOURCE_FIELDS_GM
+        return all(field in head for field in required)
 
     def _format_source_prefix(self, source_sid: str, mode: str, role: str, content: Any) -> str:
         """
-        官方风格括号前缀，尽量不破坏原文（尤其已含 group_name 的 user 行）。
+        官方风格括号前缀，尽量不破坏原文（尤其已含完整来源字段的 user 行）。
 
         官方 user 示例：
         [Jul 15 ...] [message_id: x] [group_name: 绿岛酒吧 group_id: ... user_nickname: ...] | 正文
 
         我们只在需要时外包一层：
-        - prefix:  [session: qq:gm:123][group_name: 绿岛酒吧]
+        - prefix:  [session: qq:gm:123] [group_name: 绿岛酒吧 group_id: 123]
         - compact: [gm:123|绿岛酒吧]
         - none:    不加
 
         tool / assistant 永不加前缀（对齐官方独立会话：assistant 原样落盘）。
-        user 若已有 group_name，仅补极短 [session: sid]（prefix）或跳过（若 sid 已在文中）。
-        来源与「在哪」靠：user 前缀 + window_anchor / chat_env。
+        user 若已带齐 group_name/group_id/user_nickname/user_id，仅补极短 [session: sid]；
+        缺哪个补哪个（群名/群号从会话标题与 sid 来，私聊昵称/QQ 从标题与 sid 来）。
         """
         if mode == "none" or not source_sid:
             return ""
@@ -396,23 +414,59 @@ class TimelineBuilder:
         parts = source_sid.split(":", 2)
         st = parts[1] if len(parts) >= 2 else ""
         entity = parts[2] if len(parts) >= 3 else source_sid
-        title = self._session_title(source_sid)
+        title = _safe_display_name(self._session_title(source_sid))
         text = content if isinstance(content, str) else ""
+        head = text[:240]
 
-        # 已带官方身份字段：user 只补 session sid，避免再写一遍群名
-        if role == "user" and self._content_already_has_source(text):
-            if source_sid in text[:120]:
-                return ""
+        if role == "user":
+            if self._content_already_has_source(text, st):
+                if source_sid in text[:120]:
+                    return ""
+                if mode == "compact":
+                    return f"[{st}:{entity}] " if st else f"[{source_sid}] "
+                return f"[session: {source_sid}] "
+
             if mode == "compact":
+                if st == "gm":
+                    if title and "group_name:" not in head:
+                        return f"[{st}:{entity}|{title}] "
+                    return f"[{st}:{entity}] "
+                if st == "dm":
+                    if title and "user_nickname:" not in head:
+                        return f"[{st}:{entity}|{title}] "
+                    return f"[{st}:{entity}] "
+                if title:
+                    return f"[{st}:{entity}|{title}] "
                 return f"[{st}:{entity}] " if st else f"[{source_sid}] "
-            return f"[session: {source_sid}] "
+
+            # prefix：只补缺失字段，已有的不重复
+            bits = [f"[session: {source_sid}]"]
+            if st == "gm":
+                group_bits = []
+                if "group_name:" not in head and title:
+                    group_bits.append(f"group_name: {title}")
+                if "group_id:" not in head:
+                    group_bits.append(f"group_id: {entity}")
+                if group_bits:
+                    bits.append("[" + " ".join(group_bits) + "]")
+            elif st == "dm":
+                user_bits = []
+                if "user_nickname:" not in head and title:
+                    user_bits.append(f"user_nickname: {title}")
+                if "user_id:" not in head:
+                    user_bits.append(f"user_id: {entity}")
+                if user_bits:
+                    bits.append("[" + ", ".join(user_bits) + "]")
+            elif title:
+                bits.append(f"[title: {title}]")
+            return " ".join(bits) + " "
 
         if mode == "compact":
             if title:
                 return f"[{st}:{entity}|{title}] "
             return f"[{st}:{entity}] " if st else f"[{source_sid}] "
 
-        # prefix：贴近官方 [key: value] 风格
+        # 其他角色的 prefix：保持原有行为
         if st == "gm":
             if title:
                 return f"[session: {source_sid}] [group_name: {title}] "

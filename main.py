@@ -1597,11 +1597,14 @@ class SessionMergerPlugin(BasePlugin):
             ts = int(getattr(event.message, "timestamp", 0) or getattr(event, "timestamp", 0) or time.time())
             sender_id = ""
             sender_name = ""
+            sender_card = ""
             group_name = ""
             try:
                 if event.message.sender:
                     sender_id = str(event.message.sender.user_id or "")
                     sender_name = str(event.message.sender.nickname or "")
+                    # 3.3.0 起群名片也进消息头；偷看要能说出「谁说的」。
+                    sender_card = str(getattr(event.message.sender, "group_nickname", "") or "")
                 if event.message.group:
                     group_name = str(getattr(event.message.group, "group_name", "") or "")
             except Exception:
@@ -1614,6 +1617,7 @@ class SessionMergerPlugin(BasePlugin):
                 timestamp=ts,
                 sender_id=sender_id,
                 sender_name=sender_name,
+                sender_card=sender_card,
                 group_name=group_name,
             )
         except Exception:
